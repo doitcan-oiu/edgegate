@@ -1,0 +1,9 @@
+# npm run setup generates unique local secrets; never deploy these example values.
+ADMIN_TOKEN=""
+ENCRYPTION_KEY=""
+# AI Gateway Read/Edit/Run and Account Analytics Read. No Secrets Store permission needed.
+CF_API_TOKEN=""
+# Optional: uncomment to use a separate AI Gateway Run token for inference.
+# CF_AIG_TOKEN=""
+# Optional: uncomment for Cloudflare AI REST / unified billing (Workers AI Read).
+# CF_AI_TOKEN=""

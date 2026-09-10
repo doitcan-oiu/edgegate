@@ -1,0 +1,26 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "edgegate",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./dist/client",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*", "/v1/*"]
+  },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "edgegate",
+    "database_id": "5d3400bd-7f88-4bd5-abf2-0ca62fa08e60",
+    "migrations_dir": "migrations"
+  }],
+  "kv_namespaces": [{ "binding": "KV", "id": "cc71016987ea46c68634ba42a503a5cb" }],
+  "vars": {
+    "CLOUDFLARE_ACCOUNT_ID": "9abdcffcc8a8db4c0434ffaa78e49bdc",
+    "AI_GATEWAY_ID": "aroute"
+  },
+  "triggers": { "crons": ["15 3 * * *"] },
+  "observability": { "enabled": true, "head_sampling_rate": 0.1 }
+}
