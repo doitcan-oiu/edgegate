@@ -1,6 +1,6 @@
 import { Children, createContext, isValidElement, useContext, useId, type ReactNode, type ComponentProps, type InputHTMLAttributes, type TextareaHTMLAttributes, type OptionHTMLAttributes } from 'react';
 import { Button as HeroButton, Checkbox as HeroCheckbox, Chip, Input as HeroInput, Label, ListBox, Modal as HeroModal, Select as HeroSelect, Spinner, Switch, TextArea as HeroTextArea } from '@heroui/react';
-import { AlertCircle, Check, CheckCircle2, ChevronRight, Copy, Inbox, ArrowUpRight, SlidersHorizontal, Zap } from 'lucide-react';
+import { AlertCircle, Check, CheckCircle2, ChevronRight, Copy, Inbox, ArrowUpRight, Zap } from 'lucide-react';
 import type { Log } from './types';
 import { compact, money, time, useApi } from './lib';
 
@@ -54,7 +54,7 @@ export function Modal({ title, description, children, onClose, wide = false, pre
   return <HeroModal.Backdrop isOpen onOpenChange={open => { if (!open) onClose(); }} variant="opaque" className={`eg-overlay ${presentation}`}>
     <HeroModal.Container size={wide ? 'lg' : 'md'} placement="center" scroll="inside">
       <HeroModal.Dialog className={`eg-dialog ${wide ? 'eg-dialog-wide' : ''}`}><HeroModal.CloseTrigger aria-label="关闭" />
-        <HeroModal.Header className="modal-head"><span className="eyebrow"><SlidersHorizontal size={14} />{presentation === 'drawer' ? 'WORKSPACE CONFIGURATION' : 'CONFIRM ACTION'}</span><HeroModal.Heading>{title}</HeroModal.Heading>{description && <p>{description}</p>}</HeroModal.Header>
+        <HeroModal.Header className="modal-head"><HeroModal.Heading>{title}</HeroModal.Heading>{description && <p>{description}</p>}</HeroModal.Header>
         <HeroModal.Body>{children}</HeroModal.Body>
       </HeroModal.Dialog>
     </HeroModal.Container>
