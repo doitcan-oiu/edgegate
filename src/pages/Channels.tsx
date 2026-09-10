@@ -1,5 +1,6 @@
-import { useContext, useState, type FormEvent } from 'react';
-import { ArrowLeft, ArrowUpRight, Cloud, Layers, Pencil, Plus, Search, Trash2 } from 'lucide-react';
+import '../channels.css';
+import { useContext, useEffect, useRef, useState, type FormEvent } from 'react';
+import { ArrowLeft, ArrowUpRight, ChevronLeft, ChevronRight, Layers, LockKeyhole, Pencil, Plus, Search, Trash2, X } from 'lucide-react';
 import type { Channel, CustomProvider, ProviderPage, ProviderProfile } from '../types';
 import { api, channelLabel, RefreshContext, ToastContext, useApi } from '../lib';
 import { ProviderFields } from '../ProviderFields';
@@ -66,7 +67,7 @@ function Providers({ channels }: { channels: Channel[] }) {
   async function remove() { setBusy(true); setError(''); try { await api(`/providers/${deleting!.id}`, { method: 'DELETE' }); refresh(); setDeleting(null); notify('Cloudflare 服务商已删除'); } catch (err) { setError((err as Error).message); } finally { setBusy(false); } }
   return <><div className="section-toolbar"><div className="resource-counters"><span><strong>{providers.data?.total ?? '—'}</strong>账户服务商</span></div><Button onClick={() => setEditing(null)}><Plus size={16} />创建服务商</Button></div><ErrorBox message={providers.error} />
     {providers.loading ? <Loading /> : providers.data?.data.length ? <div className="provider-grid">{providers.data.data.map(provider => <article className="surface cloud-provider-card" key={provider.id}>
-      <header><span className="square-icon"><Cloud size={22} /></span><div><h2>{provider.name}</h2><code>custom-{provider.slug}</code></div><Badge tone={provider.enable === false ? 'neutral' : 'green'}>{provider.enable === false ? '已停用' : '已启用'}</Badge></header>
+      <header><div><h2>{provider.name}</h2><code>custom-{provider.slug}</code></div><Badge tone={provider.enable === false ? 'neutral' : 'green'}>{provider.enable === false ? '已停用' : '已启用'}</Badge></header>
       <div className="provider-address"><span className="mini-label">BASE URL</span><code>{provider.base_url}</code></div>
       <div className="provider-profile"><div><span className="mini-label">协议</span><strong>{provider.protocol === 'anthropic' ? 'Anthropic Messages' : 'OpenAI Chat Completions'}</strong></div><div><span className="mini-label">模型清单</span><strong>{provider.models.length} 个模型</strong></div></div>
       <div className="tag-list">{provider.tags.length ? provider.tags.map(tag => <Badge key={tag}>{tag}</Badge>) : <span className="muted">未设置标签</span>}</div>
@@ -76,33 +77,95 @@ function Providers({ channels }: { channels: Channel[] }) {
     {editing !== undefined && <ProviderForm provider={editing} channels={channels} onClose={() => setEditing(undefined)} />}{deleting && <Confirm title={`从 Cloudflare 删除 ${deleting.name}？`} description="这会删除账户级服务商，其他应用或 Gateway 使用它的请求也会中断。本程序无法检测其他应用的依赖，请确认已停止使用。" onConfirm={remove} onClose={() => setDeleting(null)} busy={busy} error={error} />}</>;
 
 }
+type ChannelView = 'all' | 'openai' | 'anthropic' | 'configured' | 'pending' | 'disabled';
+const channelState = (channel: Channel) => !channel.enabled ? 'disabled' : channel.configured ? 'configured' : 'pending';
+const viewLabels: Record<ChannelView, string> = { all: '全部渠道', openai: 'OpenAI 兼容', anthropic: 'Anthropic', configured: '已配置', pending: '待配置', disabled: '已停用' };
+function ChannelEntry({ channel, onEdit, onDelete }: { channel: Channel; onEdit: () => void; onDelete: () => void }) {
+  const state = channelState(channel);
+  const credential = channel.has_secret ? '密钥已加密' : channel.byok_alias ? `BYOK · ${channel.byok_alias}` : channel.kind === 'openai' ? '待配置密钥' : null;
+  const provider = channel.provider_slug ? `custom-${channel.provider_slug}` : channelLabel[channel.kind];
+  const address = channel.base_url || provider;
+  return <article className={`channel-entry state-${state}`}>
+    <header className="channel-entry-heading">
+      <h3 title={channel.name}>{channel.name}</h3>
+      <span className={`entry-status is-${state}`}><i />{viewLabels[state]}</span>
+    </header>
+    <div className="channel-entry-body">
+      <dl className="channel-entry-facts">
+        <div><dt>接口协议</dt><dd className={`entry-protocol is-${channel.protocol}`}>{channel.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容'}</dd></div>
+        {channel.kind === 'openai' && <div><dt>服务商模型</dt><dd className="entry-model-count"><Layers size={14} /><strong>{channel.models.length}</strong><span>个</span></dd></div>}
+        <div className="channel-entry-endpoint"><dt>{channel.base_url ? '接入地址' : '服务商'}</dt><dd title={[provider, channel.base_url].filter(Boolean).join(' · ')}>{channel.base_url || channel.provider_slug ? <code>{address}</code> : address}</dd></div>
+      </dl>
+      {channel.kind === 'openai' && channel.models.length > 0 && <div className="channel-entry-models" aria-label="模型预览">
+        {channel.models.slice(0, 2).map(model => <code key={model} title={model}>{model}</code>)}
+        {channel.models.length > 2 && <span className="entry-more" title={channel.models.slice(2, 12).join('\n')}>+{channel.models.length - 2}</span>}
+      </div>}
+      {!!channel.tags.length && <div className="entry-tags" aria-label="渠道标签">
+        {channel.tags.slice(0, 3).map(tag => <span key={tag} title={tag}>{tag}</span>)}
+        {channel.tags.length > 3 && <span title={channel.tags.slice(3).join('、')}>+{channel.tags.length - 3}</span>}
+      </div>}
+    </div>
+    <footer className="channel-entry-footer">
+      {credential && <span className="entry-credential" title={credential}><LockKeyhole size={13} /><span>{credential}</span></span>}
+      <div className="channel-entry-operations">
+        <Button type="button" variant="ghost" className="entry-edit" aria-label={`编辑渠道 ${channel.name}`} onClick={onEdit}><Pencil size={14} />编辑</Button>
+        <Button type="button" variant="ghost" className="icon-btn entry-delete" aria-label={`删除渠道 ${channel.name}`} onClick={onDelete}><Trash2 size={15} /></Button>
+      </div>
+    </footer>
+  </article>;
+}
 export function Channels() {
   const { data, error, loading } = useApi<Channel[]>('/channels');
   const [showProviders, setShowProviders] = useState(false), [editing, setEditing] = useState<Channel | null | undefined>(), [deleting, setDeleting] = useState<Channel | null>(null);
   const [busy, setBusy] = useState(false), [deleteError, setDeleteError] = useState('');
   const { refresh } = useContext(RefreshContext), notify = useContext(ToastContext);
   async function remove() { setBusy(true); setDeleteError(''); try { await api(`/channels/${deleting!.id}`, { method: 'DELETE' }); setDeleting(null); refresh(); notify('本地渠道已删除，Cloudflare 服务商保留'); } catch (err) { setDeleteError((err as Error).message); } finally { setBusy(false); } }
-  const [search, setSearch] = useState(''), [protocol, setProtocol] = useState('all');
-  const filtered = data?.filter(channel => `${channel.name} ${channel.provider_slug || ''} ${channel.tags.join(' ')}`.toLowerCase().includes(search.toLowerCase()) && (protocol === 'all' || channel.protocol === protocol));
+  const [search, setSearch] = useState(''), [view, setView] = useState<ChannelView>('all');
+  const [page, setPage] = useState(1), [pageSize, setPageSize] = useState(20);
+  const directoryScroll = useRef<HTMLDivElement>(null);
+  const filtered = data?.filter(channel => `${channel.name} ${channel.provider_slug || ''} ${channel.base_url} ${channel.tags.join(' ')}`.toLowerCase().includes(search.trim().toLowerCase()) && (view === 'all' || channel.protocol === view || channelState(channel) === view));
+  const totalPages = Math.max(1, Math.ceil((filtered?.length || 0) / pageSize));
+  const currentPage = Math.min(page, totalPages), offset = (currentPage - 1) * pageSize;
+  const visibleChannels = filtered?.slice(offset, offset + pageSize);
+  useEffect(() => { setPage(previous => Math.min(previous, totalPages)); }, [totalPages]);
+  useEffect(() => { if (directoryScroll.current) directoryScroll.current.scrollTop = 0; }, [currentPage, pageSize, search, view]);
   if (showProviders) return <>
     <PageTitle eyebrow="02 / CONNECTIONS" title="Cloudflare 账户资源" description="管理账户级服务商的名称、状态和生命周期。日常连接与模型配置可在渠道中完成。" action={<Button variant="secondary" onClick={() => setShowProviders(false)}><ArrowLeft size={16} />返回渠道管理</Button>} />
     <Providers channels={data || []} />
   </>;
+  const configuredCount = data?.filter(channel => channel.enabled && channel.configured).length;
+  const modelCount = data ? new Set(data.flatMap(channel => channel.models)).size : undefined;
+  const hasFilters = !!search || view !== 'all';
+  const counts: Record<ChannelView, number | undefined> = { all: data?.length, openai: data?.filter(channel => channel.protocol === 'openai').length, anthropic: data?.filter(channel => channel.protocol === 'anthropic').length, configured: configuredCount, pending: data?.filter(channel => channelState(channel) === 'pending').length, disabled: data?.filter(channel => !channel.enabled).length };
+  function clearFilters() { setSearch(''); setView('all'); setPage(1); }
+  function chooseView(next: ChannelView) { setView(next); setPage(1); }
   return <>
-    <PageTitle eyebrow="02 / CONNECTIONS" title="渠道管理" description="连接上游，管理协议，组织你的模型资源。" action={<><Button variant="ghost" onClick={() => setShowProviders(true)}><Cloud size={16} />Cloudflare 账户资源</Button><Button onClick={() => setEditing(null)}><Plus size={17} />添加渠道</Button></>} />
-        <ErrorBox message={error} />
-        <div className="resource-toolbar"><div className="resource-counters"><span><strong>{data?.length ?? '—'}</strong>全部渠道</span><span><strong className="accent-text">{data?.filter(channel => channel.enabled && channel.configured).length ?? '—'}</strong>已配置</span></div><div className="toolbar-filters"><div className="search-field"><Search size={17} /><Input aria-label="搜索渠道" placeholder="搜索渠道或标签" value={search} onChange={e => setSearch(e.target.value)} /></div><Select aria-label="筛选服务商协议" value={protocol} onChange={setProtocol}><option value="all">全部协议</option><option value="openai">OpenAI 兼容</option><option value="anthropic">Anthropic</option></Select></div></div>
-        <section className="surface connection-register">{loading && !data ? <Loading /> : !filtered?.length ? <Empty title={search || protocol !== 'all' ? '没有匹配的渠道' : '连接第一个模型服务商'} description="关联 Cloudflare 自定义服务商，配置协议与模型清单。" action={<Button variant="secondary" onClick={() => setEditing(null)}><Plus size={17} />添加渠道</Button>} /> : <>
-          <div className="connection-row connection-labels"><span>渠道 / 端点</span><span>协议与标签</span><span>模型</span><span>配置状态</span><span>操作</span></div>
-          {filtered.map(channel => <article className="connection-row" key={channel.id}>
-            <div className="connection-identity"><span className={`provider-monogram ${channel.protocol}`}>{channel.protocol === 'anthropic' ? 'A' : <Cloud size={23} />}</span><div><h2>{channel.name}</h2><code>{channel.provider_slug ? `custom-${channel.provider_slug}` : channelLabel[channel.kind]}</code></div></div>
-            <div className="connection-protocol"><strong>{channel.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容'}</strong><div className="tag-list">{channel.tags.length ? channel.tags.map(tag => <Badge key={tag}>{tag}</Badge>) : <span className="muted">未设置标签</span>}</div></div>
-            <div className="connection-models"><Layers size={16} /><strong>{channel.models.length}</strong><small>个模型</small></div>
-            <div className="connection-state"><Badge tone={!channel.enabled ? 'neutral' : channel.configured ? 'green' : 'amber'}>{!channel.enabled ? '已停用' : channel.configured ? '已配置' : '待配置'}</Badge><small>超时 {channel.timeout_ms / 1000}s</small></div>
-            <div className="row-actions"><Button variant="secondary" aria-label={`编辑渠道 ${channel.name}`} onClick={() => setEditing(channel)}><Pencil size={15} />编辑</Button><Button variant="ghost" className="icon-btn danger-text" aria-label={`删除渠道 ${channel.name}`} onClick={() => { setDeleting(channel); setDeleteError(''); }}><Trash2 size={16} /></Button></div>
-          </article>)}
-        </>}</section><p className="page-footnote">配置状态反映本地连接信息的完整性，不代表上游实时可用性。</p>
-    <div className="security-note"><Cloud size={22} /><div><strong>推理请求经由 Cloudflare AI Gateway</strong><p>供应商密钥默认由本程序加密保存；缓存、日志与费用配置由 Cloudflare 管理。</p></div><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">查看文档<ArrowUpRight size={16} /></a></div>
+    <div className="channels-page">
+      <header className="channels-heading">
+        <div className="channels-heading-copy"><div className="channels-title"><h1>渠道管理</h1><span className="channels-total">{data?.length ?? '—'}</span></div><div className="channels-overview"><span><i />{configuredCount ?? '—'} 个已配置</span><span>{modelCount ?? '—'} 个服务商模型</span></div></div>
+        <div className="channels-heading-actions"><Button variant="ghost" onClick={() => setShowProviders(true)}>Cloudflare 账户资源<ArrowUpRight size={15} /></Button><Button onClick={() => setEditing(null)}><Plus size={17} />添加渠道</Button></div>
+      </header>
+
+      <div className="channels-workspace">
+        <aside className="channels-sidebar" aria-label="渠道分类">
+          <nav className="channels-category-group" aria-label="按协议筛选"><h2>渠道分类</h2>{(['all', 'openai', 'anthropic'] as const).map(category => <button type="button" className={`channels-category ${view === category ? 'is-selected' : ''}`} aria-pressed={view === category} key={category} onClick={() => chooseView(category)}><span>{viewLabels[category]}</span><span>{counts[category] ?? '—'}</span></button>)}</nav>
+          <nav className="channels-category-group" aria-label="按配置状态筛选"><h2>配置状态</h2>{(['configured', 'pending', 'disabled'] as const).map(category => <button type="button" className={`channels-category ${view === category ? 'is-selected' : ''}`} aria-pressed={view === category} key={category} onClick={() => chooseView(category)}><span><i className={`category-dot is-${category}`} />{viewLabels[category]}</span><span>{counts[category] ?? '—'}</span></button>)}</nav>
+          <div className="channels-sidebar-note"><span>Cloudflare AI Gateway</span><p>统一转发 · 日志 · 缓存</p><a href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">接入文档<ArrowUpRight size={14} /></a></div>
+        </aside>
+        <section className="channels-directory" aria-label="渠道列表">
+          <div className="channels-toolbar"><div className="channels-section-title"><h2>{viewLabels[view]}</h2><span>{filtered?.length ?? '—'}</span></div><div className="channels-search"><Search size={17} /><Input aria-label="搜索渠道" placeholder="搜索名称、地址或标签" value={search} onChange={e => { setSearch(e.target.value); setPage(1); }} />{search && <Button type="button" variant="ghost" className="icon-btn" aria-label="清除搜索" onClick={() => { setSearch(''); setPage(1); }}><X size={14} /></Button>}</div></div>
+          <ErrorBox message={error} />
+          {loading && !data ? <Loading /> : error && !data ? null : !visibleChannels?.length ? <Empty title={hasFilters ? '没有找到匹配的渠道' : '添加第一个渠道'} description={hasFilters ? '试试其他关键词，或清除当前筛选。' : '接入服务商后，在这里统一管理模型与连接。'} action={hasFilters ? <Button variant="secondary" onClick={clearFilters}>清除筛选</Button> : <Button onClick={() => setEditing(null)}><Plus size={17} />添加渠道</Button>} /> : <>
+            <div ref={directoryScroll} className="channels-entries" role="region" aria-label="供应商渠道" tabIndex={0}>{visibleChannels.map(channel => <ChannelEntry key={channel.id} channel={channel} onEdit={() => setEditing(channel)} onDelete={() => { setDeleting(channel); setDeleteError(''); }} />)}</div>
+          <footer className="channels-pagination">
+            <span className="channels-range">第 {offset + 1}–{Math.min(offset + pageSize, filtered?.length || 0)} 条，共 {filtered?.length || 0} 条</span>
+            <div className="channels-pagination-controls"><Select aria-label="每页渠道数量" value={String(pageSize)} onChange={value => { setPageSize(Number(value)); setPage(1); }}><option value="20">20 条 / 页</option><option value="50">50 条 / 页</option><option value="100">100 条 / 页</option></Select><div className="channels-page-buttons"><Button variant="ghost" className="icon-btn" aria-label="上一页渠道" disabled={currentPage === 1 || loading} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={17} /></Button><span aria-live="polite">{currentPage} <span>/ {totalPages}</span></span><Button variant="ghost" className="icon-btn" aria-label="下一页渠道" disabled={currentPage === totalPages || loading} onClick={() => setPage(currentPage + 1)}><ChevronRight size={17} /></Button></div></div>
+          </footer>
+          </>}
+        </section>
+      </div>
+      <footer className="channels-footnote"><p>配置状态仅反映连接配置，不代表上游实时可用性。</p><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">AI Gateway 接入文档<ArrowUpRight size={14} /></a></footer>
+    </div>
     {editing !== undefined && <ChannelForm channel={editing} onClose={() => setEditing(undefined)} />}
     {deleting && <Confirm title={`删除本地渠道 ${deleting.name}？`} description="此渠道、加密保存的密钥及其模型路由会被移除。Cloudflare 的服务商、已有 BYOK 密钥与日志会保留。" onConfirm={remove} onClose={() => setDeleting(null)} busy={busy} error={deleteError} />}
   </>;
