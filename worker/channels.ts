@@ -6,8 +6,10 @@ import { channelSchema, providerSchema, safeBaseUrl } from './lib/validation';
 import { channelConfigured } from './upstream';
 import { profile, profiles, saveProfile, syncCatalog } from './providers';
 import { cfApi, providerPath, publicProvider, type CustomProvider } from './cloudflare';
+import { discoverModels } from './model-discovery';
 
 export const channels = new Hono<AppEnv>();
+channels.post('/providers/models', async c => c.json(await discoverModels(c.env, await c.req.json())));
 channels.get('/providers', async c => {
   const page = Math.max(1, Math.floor(Number(c.req.query('page')) || 1));
   const query = new URLSearchParams({ page: String(page), per_page: '50' });
@@ -69,7 +71,7 @@ async function resolveCustom(env: Env, data: ChannelData, id: string, previous?:
   }
   const exists = await env.DB.prepare('SELECT provider_id FROM provider_profiles WHERE provider_id = ?').bind(provider.id).first();
   if (!exists) await saveProfile(env, provider.id, data);
-  const existingProfile = await profile(env, provider.id);
+  const existingProfile = data.update_profile ? data : await profile(env, provider.id);
   const defaultPath = `${new URL(provider.base_url).pathname.replace(/\/+$/, '').endsWith('/v1') ? '' : 'v1/'}${existingProfile.protocol === 'anthropic' ? 'messages' : 'chat/completions'}`;
   const path = (data.gateway_path || (previousCustom?.provider_id === provider.id ? previousCustom.gateway_path : '') || defaultPath).replace(/^\/+|\/+$/g, '');
   if (!path) throw invalid('上游请求路径不能为空');
@@ -102,7 +104,10 @@ channels.post('/channels', async c => {
     if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 服务商 ${custom.provider.slug} 已准备好，但本地保存失败；请从已有服务商关联并重新填写凭据`);
     throw error;
   }
-  if (custom) await syncCatalog(c.env, custom.provider.id);
+  if (custom) {
+    if (data.update_profile) await saveProfile(c.env, custom.provider.id, data);
+    else await syncCatalog(c.env, custom.provider.id);
+  }
   return c.json({ id }, 201);
 });
 channels.put('/channels/:id', async c => {
@@ -119,7 +124,10 @@ channels.put('/channels/:id', async c => {
     if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 服务商 ${custom.provider.slug} 已准备好，但本地保存失败；请重新保存渠道并确认凭据`);
     throw error;
   }
-  if (custom) await syncCatalog(c.env, custom.provider.id);
+  if (custom) {
+    if (data.update_profile) await saveProfile(c.env, custom.provider.id, data);
+    else await syncCatalog(c.env, custom.provider.id);
+  }
   return c.json({ ok: true });
 });
 channels.delete('/channels/:id', async c => {

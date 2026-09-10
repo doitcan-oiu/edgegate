@@ -16,7 +16,7 @@ app.use('*', async (c, next) => {
   c.header('Cache-Control', 'no-store');
   await next();
 });
-app.use('/api/*', bodyLimit({ maxSize: 64 * 1024, onError: () => { throw new ApiError(413, 'payload_too_large', '管理请求不能超过 64 KiB'); } }));
+app.use('/api/*', bodyLimit({ maxSize: 256 * 1024, onError: () => { throw new ApiError(413, 'payload_too_large', '管理请求不能超过 256 KiB'); } }));
 app.use('/v1/*', bodyLimit({ maxSize: 2 * 1024 * 1024, onError: () => { throw new ApiError(413, 'payload_too_large', '请求不能超过 2 MiB，请使用图片 URL 传递大型图片'); } }));
 app.use('/api/*', checkOrigin);
 app.get('/api/health', c => c.json({ status: 'ok', service: 'edgegate', setup_required: !c.env.ADMIN_TOKEN || c.env.ADMIN_TOKEN.length < 32 }));

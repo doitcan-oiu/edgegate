@@ -71,6 +71,7 @@ npm run dev
 - **创建服务商**：填写名称、账户内唯一的 slug、HTTPS Base URL。保存时调用 Cloudflare Custom Providers API。
 - **关联已有服务商**：从 Cloudflare 实时列表中选择，支持搜索和分页，不重复创建服务商。
 - **设置凭据**：默认选择「程序加密存储」，填写供应商 API Key 即可。编辑时留空保留原密钥，填入新值则替换。已有 Cloudflare BYOK 配置也可选择「使用已有 Cloudflare BYOK 别名」。
+- **获取模型清单**：填写 Base URL 和供应商 API Key 后，在「服务商模型清单」点击「从上游获取」。Worker 直接读取上游 `GET /v1/models`（已有 `/v1` 前缀不会重复添加），支持 OpenAI 和 Anthropic 认证及 Anthropic 分页。结果去重后合并到表单，保留手动填写的模型，点击保存才会更新模型和同名路由；失败或空清单不会覆盖原内容。最多支持 1000 个模型。编辑渠道时可复用原地址绑定的加密密钥；仅使用 BYOK 时需填写一个不保存的临时 API Key。
 - **设置请求路径**：请求路径会拼接到供应商的 Base URL 后面。程序使用 Cloudflare 的 Provider Native 自定义端点，不依赖 `/compat` 来转发自定义服务商。
 
 例如供应商的实际 Chat Completions 地址是 `https://api.example.com/v1/chat/completions`：
@@ -92,7 +93,7 @@ https://gateway.ai.cloudflare.com/v1/{account}/{gateway}/custom-{slug}/{path}
 
 使用已有 BYOK 别名时，Worker 改为发送 `cf-aig-byok-alias`，由 AI Gateway 使用其已配置的密钥；本程序不再调用 Secrets Store 或上传 / 修改 BYOK。两种模式互斥，切换为本地加密存储需重新输入供应商 API Key；切换为已有 BYOK 时会清除当前渠道在 D1 中保存的密文。
 
-「Cloudflare 服务商」页直接管理账户资源。修改名称、描述、启用状态会调用 Cloudflare API。为避免将共享凭据转发到其他地址，此页面不允许更改已有服务商的 slug / Base URL；需要变更目的地时新建服务商。删除本地渠道仅删除本地渠道及路由；删除 Cloudflare 服务商会影响账户内所有使用它的网关，界面会提示此影响，并阻止删除仍被本程序渠道使用的服务商。
+渠道管理默认只显示渠道列表，协议、标签和模型清单可在渠道表单中直接编辑；这些设置在当前工作空间内由同一服务商的所有关联渠道共享。右上角「Cloudflare 账户资源」是账户级管理的次级入口。修改名称、描述、启用状态会调用 Cloudflare API。为避免将共享凭据转发到其他地址，此页面不允许更改已有服务商的 slug / Base URL；需要变更目的地时新建服务商。删除本地渠道仅删除本地渠道及路由；删除 Cloudflare 服务商会影响账户内所有使用它的网关，界面会提示此影响，并阻止删除仍被本程序渠道使用的服务商。
 
 Cloudflare 与 D1 之间没有跨服务事务。如果服务商已创建但渠道保存失败，错误会给出服务商信息。可以从已有服务商重新关联并填写凭据。密钥不会上传到 Cloudflare 控制 API；推理时会随认证头发送给 AI Gateway。
 
@@ -129,7 +130,7 @@ curl https://YOUR-WORKER.workers.dev/v1/chat/completions \
 | `/v1/messages` | Anthropic | 同协议透传，转发版本与 Beta 请求头 |
 | `/v1/messages` | OpenAI | Messages 请求 → Chat Completions；响应 / SSE → Anthropic |
 
-Anthropic 服务商常用路径是 `v1/messages`（Base URL 已包含 `/v1` 时填 `messages`），OpenAI 为 `v1/chat/completions`。在服务商页切换协议会自动调整这些标准路径，特殊自定义路径需在渠道中手动调整。
+Anthropic 服务商常用路径是 `v1/messages`（Base URL 已包含 `/v1` 时填 `messages`），OpenAI 为 `v1/chat/completions`。在渠道或服务商表单中切换协议会自动调整关联渠道的这些标准路径，特殊自定义路径需在渠道中手动调整。
 
 两种端点均接受应用 `Authorization: Bearer eg_…` 或 `x-api-key: eg_…`。客户端的凭据不会转发给供应商，Cloudflare 认证和供应商认证由服务端独立设置。Anthropic 请求示例：
 
@@ -152,7 +153,7 @@ curl https://YOUR-WORKER.workers.dev/v1/messages \
 
 ## 服务商标签与模型并集
 
-创建服务商或创建新服务商渠道时，可以填写协议、标签和模型清单。已有服务商在「Cloudflare 服务商」页统一编辑。它们是 EdgeGate 的业务配置，保存在 D1，并关联 Cloudflare provider ID；不会伪装成 Cloudflare 原生标签参数。
+创建服务商或创建新服务商渠道时，可以填写协议、标签和模型清单。已有服务商可直接在渠道表单中编辑，也可通过「Cloudflare 账户资源」入口编辑。它们是 EdgeGate 的业务配置，保存在 D1，并关联 Cloudflare provider ID；不会伪装成 Cloudflare 原生标签参数。
 
 模型清单每行一个上游模型 ID。关联渠道后自动注册同名公开模型与路由；多个渠道、多个服务商共享同一公开模型时，模型列表去重，所有符合权限的路由都保留。已有自定义模型别名继续有效。
 
@@ -280,7 +281,7 @@ npx wrangler deploy --dry-run
 
 测试在隔离的 D1 / KV 中运行，模拟 Cloudflare 控制 API 和推理响应，并禁止供应商直连及 Secrets Store 操作。覆盖真实 Worker 运行时中的鉴权、并发配额、服务商管理、密钥加密与轮换、旧 BYOK 兼容、升级、跨协议认证与故障转移、SSE、日志分页和 GraphQL 聚合。测试不调用真实供应商；未提供账户凭据时无法完成云端联调。
 
-当前未实现多租户 / RBAC、充值或硬金额预算、Responses、embeddings、图像 / 音频接口、熔断与长期健康探测。前端同源访问；管理 / Playground 请求体上限 64 KiB，推理请求体 2 MiB，非流式上游响应 8 MiB。
+当前未实现多租户 / RBAC、充值或硬金额预算、Responses、embeddings、图像 / 音频接口、熔断与长期健康探测。前端同源访问；管理 / Playground 请求体上限 256 KiB，推理请求体 2 MiB，非流式上游响应 8 MiB。
 
 ## 官方参考
 

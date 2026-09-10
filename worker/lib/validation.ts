@@ -4,7 +4,8 @@ import { invalid } from './errors';
 export const nameSchema = z.string().trim().min(1).max(80);
 export const modelId = z.string().trim().min(1).max(160).regex(/^[a-zA-Z0-9@][a-zA-Z0-9._:/-]*$/, '模型 ID 只能包含字母、数字、点、下划线、斜线和短横线');
 export const tagsSchema = z.array(z.string().trim().min(1).max(40).regex(/^[\p{L}\p{N}_.\/-]+$/u, '标签可包含中英文、数字、点、下划线、斜线和短横线')).max(32).transform(tags => [...new Set(tags)].sort());
-export const profileSchema = z.object({ protocol: z.enum(['openai', 'anthropic']).default('openai'), tags: tagsSchema.default([]), models: z.array(modelId).max(100).default([]).transform(models => [...new Set(models)]) });
+export const MAX_PROVIDER_MODELS = 1000;
+export const profileSchema = z.object({ protocol: z.enum(['openai', 'anthropic']).default('openai'), tags: tagsSchema.default([]), models: z.array(modelId).max(MAX_PROVIDER_MODELS).default([]).transform(models => [...new Set(models)]) });
 
 export function safeBaseUrl(value: string) {
   let url: URL;
@@ -19,6 +20,7 @@ export function safeBaseUrl(value: string) {
 }
 export const channelSchema = z.object({
   ...profileSchema.shape,
+  update_profile: z.boolean().default(false),
   name: nameSchema,
   kind: z.enum(['cloudflare', 'ai-gateway', 'openai']),
   base_url: z.string().max(500).default(''),

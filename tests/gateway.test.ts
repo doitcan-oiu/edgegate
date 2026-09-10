@@ -18,7 +18,8 @@ type Provider = { id: string; name: string; slug: string; base_url: string; enab
 type RemoteLog = { id: string; model: string; provider: string; success: boolean; status_code?: number; tokens_in: number | null; tokens_out: number | null; duration: number; cost?: number; cached: boolean; created_at: string; metadata?: string; request_head?: string };
 let mf: Miniflare, db: Awaited<ReturnType<Miniflare['getD1Database']>>, cookie = '';
 let upstream: (request: MFRequest) => Promise<MFResponse> | MFResponse;
-let calls: Recorded[], controlCalls: Recorded[], providers: Map<string, Provider>, remoteLogs: RemoteLog[];
+let calls: Recorded[], modelCalls: Recorded[], controlCalls: Recorded[], providers: Map<string, Provider>, remoteLogs: RemoteLog[];
+let modelResponse: (request: MFRequest) => Promise<MFResponse> | MFResponse;
 let controlFailure = 0, graphqlFailure = false;
 const ok = (result: unknown, info?: unknown) => MFResponse.json({ success: true, result, ...(info ? { result_info: info } : {}) });
 const fail = (status: number) => MFResponse.json({ success: false, errors: [{ message: 'sensitive Cloudflare response' }] }, { status });
@@ -64,7 +65,10 @@ async function outbound(req: MFRequest): Promise<MFResponse> {
     if (url.pathname.startsWith(`${root}/gateways/test-gateway/logs/`)) return remoteLogs.find(l => l.id === url.pathname.split('/').at(-1)) ? ok(remoteLogs.find(l => l.id === url.pathname.split('/').at(-1))) : fail(404);
     return fail(404);
   }
-  // This mock forbids every supplier-direct request. Only Cloudflare is a valid inference destination.
+  // Only read-only model discovery may contact suppliers directly; inference must use Cloudflare.
+  if (req.method === 'GET' && url.pathname.endsWith('/v1/models')) {
+    modelCalls.push(record); return modelResponse(req);
+  }
   if (url.hostname !== 'gateway.ai.cloudflare.com' && url.hostname !== 'api.cloudflare.com') throw new Error(`Direct provider egress forbidden: ${url.hostname}`);
   calls.push(record);
   const response = await upstream(req);
@@ -103,7 +107,8 @@ beforeAll(async () => {
   }
 });
 beforeEach(async () => {
-  calls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false;
+  calls = []; modelCalls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false;
+  modelResponse = () => MFResponse.json({ data: [{ id: 'model-a' }, { id: 'model-b' }, { id: 'model-a' }] });
   upstream = () => MFResponse.json(completion);
   await db.batch(['provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
   const response = await request('/api/auth/login', { body: { token: ADMIN } }); expect(response.status).toBe(200);
@@ -568,5 +573,129 @@ describe('dual API endpoints through Cloudflare AI Gateway', () => {
     const reverse = await chat((await key({ allowed_tags: ['claude'] })).key, { model: 'sonnet', stream: true, stream_options: { include_usage: true } });
     expect(reverse.status).toBe(200); const reversed = await reverse.text(); expect(reversed).toContain('chat.completion.chunk'); expect(reversed).toContain('你好'); expect(reversed).toContain('[DONE]');
     expect(await db.prepare('SELECT COUNT(*) AS n FROM request_logs').first()).toMatchObject({ n: 0 });
+  });
+});
+
+describe('upstream model discovery', () => {
+  it('requires an admin session and rejects cross-origin requests', async () => {
+    const body = { base_url: 'https://supplier.example.com', secret: 'temporary-key' };
+    expect((await request('/api/providers/models', { body })).status).toBe(401);
+    expect((await request('/api/providers/models', { admin: true, body, headers: { Origin: 'https://evil.example' } })).status).toBe(403);
+    expect(modelCalls).toHaveLength(0);
+  });
+  it.each([
+    ['https://supplier.example.com', 'https://supplier.example.com/v1/models'],
+    ['https://supplier.example.com/v1/', 'https://supplier.example.com/v1/models'],
+    ['https://supplier.example.com/api/', 'https://supplier.example.com/api/v1/models'],
+    ['https://supplier.example.com/api/v1/', 'https://supplier.example.com/api/v1/models'],
+  ])('fetches unique models using the entered URL %s without persisting anything', async (base_url, expected) => {
+    const result = await admin('/providers/models', { base_url, secret: 'temporary-key' });
+    expect(result).toEqual({ models: ['model-a', 'model-b'] });
+    expect(modelCalls).toHaveLength(1);
+    expect(modelCalls[0].url).toBe(expected);
+    expect(modelCalls[0].headers.authorization).toBe('Bearer temporary-key');
+    expect(modelCalls[0].headers['cf-aig-authorization']).toBeUndefined();
+    expect(modelCalls[0].headers.cookie).toBeUndefined();
+    expect(providers.size).toBe(1);
+    expect((await db.prepare('SELECT * FROM provider_profiles LIMIT 1').first())).toMatchObject({ models: '[]' });
+    expect(await db.prepare("SELECT id FROM models WHERE id = 'model-a'").first()).toBeNull();
+    expect(JSON.stringify(result)).not.toContain('temporary-key');
+  });
+  it('reuses the bound channel secret without returning it to the browser', async () => {
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    const result = await admin('/providers/models', { base_url: current.base_url, channel_id: current.id, provider_id: current.provider_id });
+    expect(result).toEqual({ models: ['model-a', 'model-b'] });
+    expect(modelCalls[0].headers.authorization).toBe('Bearer provider-secret');
+    expect(JSON.stringify(result)).not.toContain('provider-secret');
+  });
+  it.each(['base_url', 'provider_id', 'kind'])('does not reuse a saved credential after changing %s', async change => {
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    const body = { base_url: current.base_url, channel_id: current.id, provider_id: current.provider_id };
+    if (change === 'base_url') body.base_url = 'https://other.example.com';
+    if (change === 'provider_id') body.provider_id = 'different-provider';
+    if (change === 'kind') await db.prepare("UPDATE channels SET kind = 'cloudflare' WHERE id = ?").bind(current.id).run();
+    expect((await request('/api/providers/models', { admin: true, body })).status).toBe(400);
+    expect(modelCalls).toHaveLength(0);
+  });
+  it('uses an explicitly supplied key in preference to a saved key without rotating it', async () => {
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    await admin('/providers/models', { base_url: current.base_url, channel_id: current.id, secret: 'temporary-override' });
+    expect(modelCalls[0].headers.authorization).toBe('Bearer temporary-override');
+    expect(await db.prepare('SELECT secret_encrypted FROM channels WHERE id = ?').bind(current.id).first()).toEqual({ secret_encrypted: current.secret_encrypted });
+  });
+  it('reads every Anthropic page with protocol-specific authentication', async () => {
+    modelResponse = req => new URL(req.url).searchParams.has('after_id')
+      ? MFResponse.json({ data: [{ id: 'claude-a' }, { id: 'claude-b' }], has_more: false })
+      : MFResponse.json({ data: [{ id: 'claude-a' }], has_more: true, last_id: 'claude-a' });
+    expect(await admin('/providers/models', { base_url: 'https://anthropic.example.com/v1', protocol: 'anthropic', secret: 'anthropic-key' })).toEqual({ models: ['claude-a', 'claude-b'] });
+    expect(modelCalls).toHaveLength(2);
+    expect(modelCalls[1].url).toContain('after_id=claude-a');
+    expect(modelCalls[0].headers).toMatchObject({ 'x-api-key': 'anthropic-key', 'anthropic-version': '2023-06-01' });
+    expect(modelCalls[0].headers.authorization).toBeUndefined();
+  });
+  it.each([401, 403, 404, 429, 500, 302])('returns a useful error for HTTP %s without exposing upstream bodies or following redirects', async status => {
+    modelResponse = () => new MFResponse('temporary-key echoed by supplier', { status, headers: status === 302 ? { Location: 'https://redirect.example.com/v1/models' } : {} });
+    const response = await request('/api/providers/models', { admin: true, body: { base_url: 'https://supplier.example.com', secret: 'temporary-key' } });
+    expect(response.status).toBe(502);
+    expect(await response.text()).not.toContain('temporary-key');
+    expect(modelCalls).toHaveLength(1);
+  });
+  it.each([{}, { data: [] }, { data: [{ name: 'missing-id' }] }, { data: [{ id: 'invalid model id' }] }, { data: [{ id: 'model-a' }], has_more: true }])('rejects an incomplete or invalid catalog: %j', async payload => {
+    modelResponse = () => MFResponse.json(payload);
+    expect((await request('/api/providers/models', { admin: true, body: { base_url: 'https://supplier.example.com', secret: 'temporary-key' } })).status).toBe(502);
+  });
+  it('detects repeated pagination cursors instead of returning a partial catalog', async () => {
+    modelResponse = () => MFResponse.json({ data: [{ id: 'model-a' }], has_more: true, last_id: 'model-a' });
+    expect((await request('/api/providers/models', { admin: true, body: { base_url: 'https://supplier.example.com', protocol: 'anthropic', secret: 'temporary-key' } })).status).toBe(502);
+    expect(modelCalls).toHaveLength(2);
+  });
+  it('supports more than 100 models through discovery and saving channel routes', async () => {
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    const models = Array.from({ length: 600 }, (_, index) => `model-${String(index).padStart(3, '0')}-${'x'.repeat(110)}`);
+    modelResponse = () => MFResponse.json({ data: models.map(id => ({ id })) });
+    const discovered = await admin<{ models: string[] }>('/providers/models', { base_url: current.base_url, channel_id: current.id });
+    expect(discovered.models).toEqual(models);
+    await admin(`/channels/${current.id}`, { name: current.name, kind: 'openai', provider_id: current.provider_id, update_profile: true, models: discovered.models }, 'PUT');
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM routes WHERE channel_id = ? AND managed_by_provider = 1').bind(current.id).first()).toEqual({ n: 600 });
+  });
+  it('rejects oversized model lists without truncating them', async () => {
+    modelResponse = () => MFResponse.json({ data: Array.from({ length: 1001 }, (_, index) => ({ id: `model-${index}` })) });
+    const response = await request('/api/providers/models', { admin: true, body: { base_url: 'https://supplier.example.com', secret: 'temporary-key' } });
+    expect(response.status).toBe(502);
+    expect(await response.text()).toContain('1000');
+  });
+  it('rejects unsafe URLs, absent keys and BYOK-only credentials before making requests', async () => {
+    for (const base_url of ['http://supplier.example.com', 'https://127.0.0.1', 'https://localhost', 'https://user:pass@supplier.example.com']) {
+      expect((await request('/api/providers/models', { admin: true, body: { base_url, secret: 'temporary-key' } })).status).toBe(400);
+    }
+    expect((await request('/api/providers/models', { admin: true, body: { base_url: 'https://supplier.example.com' } })).status).toBe(400);
+    const current = (await db.prepare('SELECT * FROM channels LIMIT 1').first<Channel>())!;
+    await db.prepare("UPDATE channels SET secret_encrypted = NULL, byok_alias = 'default' WHERE id = ?").bind(current.id).run();
+    const response = await request('/api/providers/models', { admin: true, body: { base_url: current.base_url, channel_id: current.id } });
+    expect(response.status).toBe(400); expect(await response.text()).toContain('BYOK');
+    expect(modelCalls).toHaveLength(0);
+  });
+});
+
+describe('editing shared provider profiles from channel forms', () => {
+  it('updates the catalog and protocol of all linked channels while preserving manual aliases', async () => {
+    const a = await catalog('Inline', 'openai', ['old'], ['old-model']);
+    const b = await admin<{ id: string }>('/channels', { name: 'Second credential', kind: 'openai', provider_id: a.provider.id, secret: 'second-key' });
+    await admin('/routes', { model_id: 'test-model', channel_id: a.channelId, upstream_model: 'old-model' });
+    await admin(`/channels/${a.channelId}`, { name: 'Inline updated', kind: 'openai', provider_id: a.provider.id, update_profile: true, protocol: 'anthropic', tags: ['new'], models: ['new-model'], secret: 'anthropic-key', gateway_path: 'v1/messages' }, 'PUT');
+    const list = await admin<(Channel & { protocol: string; models: string[]; tags: string[] })[]>('/channels');
+    for (const id of [a.channelId, b.id]) expect(list.find(channel => channel.id === id)).toMatchObject({ protocol: 'anthropic', tags: ['new'], models: ['new-model'], gateway_path: 'v1/messages' });
+    expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ? ORDER BY model_id').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'new-model' }, { model_id: 'test-model' }] });
+  });
+  it('does not overwrite a shared profile when saving only connection settings', async () => {
+    const a = await catalog('Shared', 'openai', ['production'], ['current-model']);
+    await admin(`/channels/${a.channelId}`, { name: 'Renamed', kind: 'openai', provider_id: a.provider.id, tags: ['stale'], models: ['stale-model'] }, 'PUT');
+    expect(await db.prepare('SELECT tags, models FROM provider_profiles WHERE provider_id = ?').bind(a.provider.id).first()).toEqual({ tags: '["production"]', models: '["current-model"]' });
+  });
+  it('saves edited models when linking a new channel to an existing provider', async () => {
+    const a = await catalog('Existing', 'openai', ['production'], ['old-model']);
+    const b = await admin<{ id: string }>('/channels', { name: 'New link', kind: 'openai', provider_id: a.provider.id, secret: 'new-key', update_profile: true, tags: ['production'], models: ['new-model'] });
+    expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(b.id).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
+    expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
   });
 });
