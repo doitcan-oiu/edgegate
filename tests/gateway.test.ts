@@ -103,7 +103,7 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
@@ -699,6 +699,58 @@ describe('editing shared provider profiles from channel forms', () => {
     const b = await admin<{ id: string }>('/channels', { name: 'New link', kind: 'openai', provider_id: a.provider.id, secret: 'new-key', update_profile: true, tags: ['production'], models: ['new-model'] });
     expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(b.id).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
     expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
+  });
+});
+
+describe('channel automatic route creation', () => {
+  it('saves an opted-out catalog without creating application models or routes', async () => {
+    const created = await admin<{ id: string }>('/channels', { name: 'Manual catalog', kind: 'openai', provider_slug: 'manual-catalog', base_url: 'https://manual.example.com', secret: 'provider-key', models: ['catalog-only'], auto_create_routes: false });
+    const saved = (await admin<Channel[]>('/channels')).find(channel => channel.id === created.id)!;
+    expect(saved).toMatchObject({ auto_create_routes: 0, models: ['catalog-only'] });
+    expect(await db.prepare('SELECT id FROM models WHERE id = ?').bind('catalog-only').first()).toBeNull();
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM routes WHERE channel_id = ?').bind(created.id).first()).toEqual({ n: 0 });
+    await admin('/models', { id: 'manual-alias' });
+    await admin('/routes', { model_id: 'manual-alias', channel_id: created.id, upstream_model: 'catalog-only' });
+    expect(await visibleModels((await key()).key)).toContain('manual-alias');
+  });
+  it.each([undefined, true])('creates routes when automatic creation is %s', async auto_create_routes => {
+    const created = await admin<{ id: string }>('/channels', { name: 'Automatic', kind: 'openai', provider_slug: 'automatic', base_url: 'https://automatic.example.com', secret: 'provider-key', models: ['auto-model'], auto_create_routes });
+    expect((await admin<Channel[]>('/channels')).find(channel => channel.id === created.id)).toMatchObject({ auto_create_routes: 1 });
+    expect(await db.prepare('SELECT model_id, upstream_model, managed_by_provider FROM routes WHERE channel_id = ?').bind(created.id).all()).toMatchObject({ results: [{ model_id: 'auto-model', upstream_model: 'auto-model', managed_by_provider: 1 }] });
+  });
+  it('keeps the choice when editing or synchronizing a shared provider', async () => {
+    const a = await catalog('SharedAuto', 'openai', ['public'], ['original']);
+    const b = await admin<{ id: string }>('/channels', { name: 'Manual link', kind: 'openai', provider_id: a.provider.id, secret: 'second-key', auto_create_routes: false, update_profile: true, models: ['replacement'] });
+    expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'replacement' }] });
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM routes WHERE channel_id = ?').bind(b.id).first()).toEqual({ n: 0 });
+    await editProvider(a.provider, { models: ['latest'] });
+    // An older client omitting the flag must not silently turn it back on.
+    await admin(`/channels/${b.id}`, { name: 'Renamed manual link', kind: 'openai', provider_id: a.provider.id }, 'PUT');
+    expect((await admin<Channel[]>('/channels')).find(channel => channel.id === b.id)).toMatchObject({ auto_create_routes: 0, models: ['latest'] });
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM routes WHERE channel_id = ?').bind(b.id).first()).toEqual({ n: 0 });
+    expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'latest' }] });
+  });
+  it('preserves existing routes while off and reconciles the current catalog when re-enabled', async () => {
+    const a = await catalog('ToggleAuto', 'openai', [], ['original']);
+    const manual = await admin<{ id: string }>('/routes', { model_id: 'test-model', channel_id: a.channelId, upstream_model: 'original', priority: 3, weight: 7 });
+    const before = (await db.prepare('SELECT * FROM routes WHERE channel_id = ? ORDER BY id').bind(a.channelId).all()).results;
+    const update = { name: 'ToggleAuto', kind: 'openai', provider_id: a.provider.id };
+    await admin(`/channels/${a.channelId}`, { ...update, auto_create_routes: false, update_profile: true, models: ['replacement'] }, 'PUT');
+    await editProvider(a.provider, { models: ['latest'] });
+    expect((await db.prepare('SELECT * FROM routes WHERE channel_id = ? ORDER BY id').bind(a.channelId).all()).results).toEqual(before);
+    expect(await db.prepare('SELECT id FROM models WHERE id IN (?, ?)').bind('replacement', 'latest').all()).toMatchObject({ results: [] });
+    await admin(`/channels/${a.channelId}`, { ...update, auto_create_routes: true }, 'PUT');
+    await admin(`/channels/${a.channelId}`, update, 'PUT');
+    expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ? ORDER BY model_id').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'latest' }, { model_id: 'test-model' }] });
+    expect(await db.prepare('SELECT priority, weight, managed_by_provider FROM routes WHERE id = ?').bind(manual.id).first()).toEqual({ priority: 3, weight: 7, managed_by_provider: 0 });
+  });
+  it('rejects non-boolean choices before creating provider resources', async () => {
+    const previousCalls = controlCalls.length;
+    for (const auto_create_routes of ['false', 0, null]) {
+      const response = await request('/api/channels', { admin: true, body: { name: 'Invalid', kind: 'openai', provider_slug: 'invalid', base_url: 'https://invalid.example.com', secret: 'provider-key', auto_create_routes } });
+      expect(response.status).toBe(400);
+    }
+    expect(controlCalls).toHaveLength(previousCalls);
   });
 });
 

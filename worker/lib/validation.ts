@@ -21,6 +21,7 @@ export function safeBaseUrl(value: string) {
 export const channelSchema = z.object({
   ...profileSchema.shape,
   update_profile: z.boolean().default(false),
+  auto_create_routes: z.boolean().optional(),
   name: nameSchema,
   kind: z.enum(['cloudflare', 'ai-gateway', 'openai']),
   base_url: z.string().max(500).default(''),

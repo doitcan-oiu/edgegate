@@ -13,12 +13,14 @@ function catalogStatements(env: Env, id: string) {
   // Read the current catalog inside the D1 batch. Linking another channel must
   // never write a stale copy of provider tags over a concurrent permission edit.
   return [
-    env.DB.prepare(`INSERT OR IGNORE INTO models (id) SELECT value FROM json_each((SELECT models FROM provider_profiles WHERE provider_id = ?))`).bind(id),
-    env.DB.prepare(`DELETE FROM routes WHERE managed_by_provider = 1 AND channel_id IN (SELECT id FROM channels WHERE provider_id = ?)
+    env.DB.prepare(`INSERT OR IGNORE INTO models (id) SELECT value FROM json_each((SELECT models FROM provider_profiles WHERE provider_id = ?))
+      WHERE EXISTS (SELECT 1 FROM channels WHERE provider_id = ? AND auto_create_routes = 1)`).bind(id, id),
+    env.DB.prepare(`DELETE FROM routes WHERE managed_by_provider = 1 AND channel_id IN (SELECT id FROM channels WHERE provider_id = ? AND auto_create_routes = 1)
       AND model_id NOT IN (SELECT value FROM json_each((SELECT models FROM provider_profiles WHERE provider_id = ?)))`).bind(id, id),
     env.DB.prepare(`INSERT OR IGNORE INTO routes (id, model_id, channel_id, upstream_model, managed_by_provider)
       SELECT 'rt_' || lower(hex(randomblob(12))), model.value, channel.id, model.value, 1
-      FROM channels AS channel, json_each((SELECT models FROM provider_profiles WHERE provider_id = ?)) AS model WHERE channel.provider_id = ?`).bind(id, id),
+      FROM channels AS channel, json_each((SELECT models FROM provider_profiles WHERE provider_id = ?)) AS model
+      WHERE channel.provider_id = ? AND channel.auto_create_routes = 1`).bind(id, id),
   ];
 }
 export async function syncCatalog(env: Env, id: string) {

@@ -16,7 +16,7 @@ export interface ProviderProfile { protocol: Protocol; tags: string[]; models: s
 export interface Channel {
   id: string; name: string; kind: 'cloudflare' | 'ai-gateway' | 'openai';
   base_url: string; secret_encrypted: string | null; enabled: number; timeout_ms: number;
-  created_at: string;
+  created_at: string; auto_create_routes: number;
   provider_id: string | null; provider_slug: string | null; gateway_path: string; byok_alias: string;
   protocol?: Protocol; tags?: string[];
 }

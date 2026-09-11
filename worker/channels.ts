@@ -98,8 +98,8 @@ channels.post('/channels', async c => {
   const custom = data.kind === 'openai' ? await resolveCustom(c.env, data, id) : null;
   const encrypted = custom ? custom.encrypted : data.secret ? await encryptChannelSecret(c.env, data.secret, id) : null;
   try {
-    await c.env.DB.prepare('INSERT INTO channels (id, name, kind, base_url, secret_encrypted, enabled, timeout_ms, provider_id, provider_slug, gateway_path, byok_alias) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .bind(id, data.name, data.kind, custom?.provider.base_url || '', encrypted, +data.enabled, data.timeout_ms, custom?.provider.id || null, custom?.provider.slug || null, custom?.path || data.gateway_path || 'chat/completions', custom?.alias || '').run();
+    await c.env.DB.prepare('INSERT INTO channels (id, name, kind, base_url, secret_encrypted, enabled, timeout_ms, provider_id, provider_slug, gateway_path, byok_alias, auto_create_routes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .bind(id, data.name, data.kind, custom?.provider.base_url || '', encrypted, +data.enabled, data.timeout_ms, custom?.provider.id || null, custom?.provider.slug || null, custom?.path || data.gateway_path || 'chat/completions', custom?.alias || '', +(data.auto_create_routes ?? true)).run();
   } catch (error) {
     if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 服务商 ${custom.provider.slug} 已准备好，但本地保存失败；请从已有服务商关联并重新填写凭据`);
     throw error;
@@ -118,8 +118,8 @@ channels.put('/channels/:id', async c => {
   const custom = data.kind === 'openai' ? await resolveCustom(c.env, data, id, previous) : null;
   const encrypted = custom ? custom.encrypted : data.secret ? await encryptChannelSecret(c.env, data.secret, id) : data.kind === previous.kind ? previous.secret_encrypted : null;
   try {
-    await c.env.DB.prepare('UPDATE channels SET name = ?, kind = ?, base_url = ?, secret_encrypted = ?, enabled = ?, timeout_ms = ?, provider_id = ?, provider_slug = ?, gateway_path = ?, byok_alias = ? WHERE id = ?')
-      .bind(data.name, data.kind, custom?.provider.base_url || '', encrypted, +data.enabled, data.timeout_ms, custom?.provider.id || null, custom?.provider.slug || null, custom?.path || data.gateway_path || 'chat/completions', custom?.alias || '', id).run();
+    await c.env.DB.prepare('UPDATE channels SET name = ?, kind = ?, base_url = ?, secret_encrypted = ?, enabled = ?, timeout_ms = ?, provider_id = ?, provider_slug = ?, gateway_path = ?, byok_alias = ?, auto_create_routes = ? WHERE id = ?')
+      .bind(data.name, data.kind, custom?.provider.base_url || '', encrypted, +data.enabled, data.timeout_ms, custom?.provider.id || null, custom?.provider.slug || null, custom?.path || data.gateway_path || 'chat/completions', custom?.alias || '', +(data.auto_create_routes ?? !!previous.auto_create_routes), id).run();
   } catch (error) {
     if (custom) throw new ApiError(503, 'local_save_failed', `Cloudflare 服务商 ${custom.provider.slug} 已准备好，但本地保存失败；请重新保存渠道并确认凭据`);
     throw error;

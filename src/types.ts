@@ -1,7 +1,7 @@
 export interface Channel {
   protocol: 'openai' | 'anthropic'; tags: string[]; models: string[];
   id: string; name: string; kind: 'cloudflare' | 'ai-gateway' | 'openai'; base_url: string;
-  enabled: number; timeout_ms: number; has_secret: boolean; configured: boolean; created_at: string;
+  enabled: number; timeout_ms: number; has_secret: boolean; configured: boolean; created_at: string; auto_create_routes: number;
   provider_id: string | null; provider_slug: string | null; gateway_path: string; byok_alias: string;
 }
 export interface ProviderProfile { protocol: 'openai' | 'anthropic'; tags: string[]; models: string[] }

@@ -71,7 +71,8 @@ npm run dev
 - **创建服务商**：填写名称、账户内唯一的 slug、HTTPS Base URL。保存时调用 Cloudflare Custom Providers API。
 - **关联已有服务商**：从 Cloudflare 实时列表中选择，支持搜索和分页，不重复创建服务商。
 - **设置凭据**：默认选择「程序加密存储」，填写供应商 API Key 即可。编辑时留空保留原密钥，填入新值则替换。已有 Cloudflare BYOK 配置也可选择「使用已有 Cloudflare BYOK 别名」。
-- **获取模型清单**：填写 Base URL 和供应商 API Key 后，在「服务商模型清单」点击「从上游获取」。Worker 直接读取上游 `GET /v1/models`（已有 `/v1` 前缀不会重复添加），支持 OpenAI 和 Anthropic 认证及 Anthropic 分页。结果去重后合并到表单，保留手动填写的模型，点击保存才会更新模型和同名路由；失败或空清单不会覆盖原内容。最多支持 1000 个模型。编辑渠道时可复用原地址绑定的加密密钥；仅使用 BYOK 时需填写一个不保存的临时 API Key。
+- **获取模型清单**：填写 Base URL 和供应商 API Key 后，在「服务商模型清单」点击「从上游获取」。Worker 直接读取上游 `GET /v1/models`（已有 `/v1` 前缀不会重复添加），支持 OpenAI 和 Anthropic 认证及 Anthropic 分页。结果去重后合并到表单，保留手动填写的模型，点击保存才会更新清单，并按渠道的自动路由开关处理同名路由；失败或空清单不会覆盖原内容。最多支持 1000 个模型。编辑渠道时可复用原地址绑定的加密密钥；仅使用 BYOK 时需填写一个不保存的临时 API Key。
+- **自动建立同名路由**：渠道表单中的开关默认开启，保存后按模型清单自动建立同名模型与路由。关闭后仅保存清单，已有路由保持不变，可在「模型与路由」手动配置。开关按渠道保存；共享服务商清单更新时，仅同步开启此选项的渠道，重新开启后按当前清单同步。
 - **设置请求路径**：请求路径会拼接到供应商的 Base URL 后面。程序使用 Cloudflare 的 Provider Native 自定义端点，不依赖 `/compat` 来转发自定义服务商。
 
 例如供应商的实际 Chat Completions 地址是 `https://api.example.com/v1/chat/completions`：
@@ -155,7 +156,7 @@ curl https://YOUR-WORKER.workers.dev/v1/messages \
 
 创建服务商或创建新服务商渠道时，可以填写协议、标签和模型清单。已有服务商可直接在渠道表单中编辑，也可通过「Cloudflare 账户资源」入口编辑。它们是 EdgeGate 的业务配置，保存在 D1，并关联 Cloudflare provider ID；不会伪装成 Cloudflare 原生标签参数。
 
-模型清单每行一个上游模型 ID。关联渠道后自动注册同名公开模型与路由；多个渠道、多个服务商共享同一公开模型时，模型列表去重，所有符合权限的路由都保留。已有自定义模型别名继续有效。
+模型清单支持输入模型 ID 后回车添加标签，也可粘贴多行或逗号分隔内容。开启「自动建立同名路由」的渠道会注册同名公开模型与路由，关闭时只保存清单；多个渠道、多个服务商共享同一公开模型时，模型列表去重，所有符合权限的路由都保留。已有自定义模型别名继续有效。
 
 创建 API Key 时可选择服务商标签，规则如下：
 
@@ -219,7 +220,7 @@ npm run db:migrate          # 本地
 npm run db:migrate:remote
 ```
 
-`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。定时任务清理过期配额计数及超过 7 天的错误追踪。
+`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。`0005_channel_auto_routes.sql` 新增渠道自动路由开关，现有渠道默认开启。定时任务清理过期配额计数及超过 7 天的错误追踪。
 
 旧「OpenAI 兼容」直连渠道会显示待配置，**不会继续直连供应商**。编辑渠道，将其关联到 Cloudflare 服务商，并确认请求路径。仅当完整上游 URL 与旧地址完全一致时，才会保留原有加密 Key；目的地不一致需重新输入密钥或提供已有 BYOK 别名。关联后推理经过 AI Gateway，密钥继续加密保存在 D1。
 

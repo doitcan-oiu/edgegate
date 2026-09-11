@@ -35,16 +35,16 @@ export function orderCandidates(candidates: Candidate[], random = Math.random, s
 export async function getCandidates(env: Env, model?: string, allowedTags: string[] = []): Promise<Candidate[]> {
   const { results } = await env.DB.prepare(`SELECT r.*,
     c.name AS c_name, c.kind AS c_kind, c.base_url AS c_base_url,
-    c.secret_encrypted AS c_secret, c.timeout_ms AS c_timeout, c.created_at AS c_created,
+    c.secret_encrypted AS c_secret, c.timeout_ms AS c_timeout, c.created_at AS c_created, c.auto_create_routes AS c_auto_routes,
     c.provider_id AS c_provider_id, c.provider_slug AS c_provider_slug, c.gateway_path AS c_path, c.byok_alias AS c_alias, COALESCE(p.protocol, 'openai') AS c_protocol, COALESCE(p.tags, '[]') AS c_tags
     FROM routes r JOIN channels c ON c.id = r.channel_id JOIN models m ON m.id = r.model_id LEFT JOIN provider_profiles p ON p.provider_id = c.provider_id
     WHERE (? IS NULL OR r.model_id = ?) AND (json_array_length(?) = 0 OR EXISTS (SELECT 1 FROM json_each(p.tags) AS tag JOIN json_each(?) AS allowed ON tag.value = allowed.value)) AND r.enabled = 1 AND c.enabled = 1 AND m.enabled = 1 ORDER BY r.priority, r.id`).bind(model ?? null, model ?? null, JSON.stringify(allowedTags), JSON.stringify(allowedTags)).all<Route & {
-      c_name: string; c_kind: Channel['kind']; c_base_url: string; c_secret: string | null; c_timeout: number; c_created: string;
+      c_name: string; c_kind: Channel['kind']; c_base_url: string; c_secret: string | null; c_timeout: number; c_created: string; c_auto_routes: number;
       c_protocol: 'openai' | 'anthropic'; c_tags: string; c_provider_id: string | null; c_provider_slug: string | null; c_path: string; c_alias: string;
     }>();
   return results.map(r => ({ ...r, channel: {
     protocol: r.c_protocol, tags: JSON.parse(r.c_tags), id: r.channel_id, name: r.c_name, kind: r.c_kind, base_url: r.c_base_url, secret_encrypted: r.c_secret,
-    enabled: 1, timeout_ms: r.c_timeout, created_at: r.c_created,
+    enabled: 1, timeout_ms: r.c_timeout, created_at: r.c_created, auto_create_routes: r.c_auto_routes,
     provider_id: r.c_provider_id, provider_slug: r.c_provider_slug, gateway_path: r.c_path, byok_alias: r.c_alias,
   } })).filter(r => channelConfigured(r.channel, env));
 }
