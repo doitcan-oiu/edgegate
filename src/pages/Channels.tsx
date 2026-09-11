@@ -1,4 +1,5 @@
 import '../channels.css';
+import { MAX_CHANNEL_TIMEOUT_SECONDS } from '../../shared/channel-limits';
 import { useContext, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowLeft, ArrowUpRight, ChevronLeft, ChevronRight, Pencil, Plus, Search, Trash2, X } from 'lucide-react';
 import type { Channel, CustomProvider, ProviderPage, ProviderProfile } from '../types';
@@ -51,7 +52,7 @@ function ChannelForm({ channel, onClose }: { channel: Channel | null; onClose: (
       {mode === 'existing' && <div className="info-note">协议、标签和模型清单由此服务商的关联渠道共享；保存修改会同步到本工作空间内的所有关联渠道。</div>}
       {channel?.has_secret && !channel.provider_id && <div className="info-note">此渠道来自旧版直连配置。关联到相同上游地址后可继续使用已加密的密钥，推理会经过 AI Gateway。</div>}
     </> : <><div className="info-note">{kind === 'cloudflare' ? '使用 Cloudflare AI REST API 与统一计费。' : '调用 AI Gateway 的内置模型或 dynamic/ 动态路由；供应商凭据在 Cloudflare BYOK 配置。'} Account ID 和 Gateway ID 在 Worker 环境变量中配置。</div><Field label="Cloudflare Token（可选覆盖）" hint={`留空使用 ${kind === 'cloudflare' ? 'CF_AI_TOKEN' : 'CF_AIG_TOKEN / CF_API_TOKEN'}。`}><Input type="password" autoComplete="new-password" value={secret} onChange={e => setSecret(e.target.value)} placeholder={channel?.has_secret ? '已保存，留空保持不变' : '使用 Worker Secret'} /></Field></>}
-    </FormSection><FormSection number="03" title="运行策略"><Field label="请求超时（秒）"><Input type="number" min={1} max={120} required value={timeout} onChange={e => setTimeoutValue(Number(e.target.value))} /></Field><Toggle checked={enabled} onChange={setEnabled} label="启用渠道" /></FormSection>
+    </FormSection><FormSection number="03" title="运行策略"><Field label="单次请求总超时（秒）" hint={`从发起上游请求到完整响应结束，包含 SSE 全程，不是首字超时。1–${MAX_CHANNEL_TIMEOUT_SECONDS} 秒；20 分钟填 1200。每次重试独立计时。`}><Input type="number" min={1} max={MAX_CHANNEL_TIMEOUT_SECONDS} step={1} required value={timeout} onChange={e => setTimeoutValue(Number(e.target.value))} /></Field><Toggle checked={enabled} onChange={setEnabled} label="启用渠道" /></FormSection>
     <ErrorBox message={error} /><div className="modal-actions"><Button type="button" variant="secondary" onClick={onClose} disabled={busy}>取消</Button><Button disabled={busy || fetching}>{busy ? '正在配置 Cloudflare…' : '保存渠道'}</Button></div></form></Modal>;
 }
 function ProviderForm({ provider, channels, onClose }: { provider: CustomProvider | null; channels: Channel[]; onClose: () => void }) {

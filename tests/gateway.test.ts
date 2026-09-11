@@ -103,7 +103,7 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
@@ -699,6 +699,17 @@ describe('editing shared provider profiles from channel forms', () => {
     const b = await admin<{ id: string }>('/channels', { name: 'New link', kind: 'openai', provider_id: a.provider.id, secret: 'new-key', update_profile: true, tags: ['production'], models: ['new-model'] });
     expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(b.id).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
     expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
+  });
+});
+
+describe('long channel timeout settings', () => {
+  it('persists timeout values above 10 minutes when creating and updating channels', async () => {
+    const created = await admin<{ id: string }>('/channels', { name: 'Long streaming', kind: 'cloudflare', timeout_ms: 1200000 });
+    expect((await admin<Channel[]>('/channels')).find(c => c.id === created.id)?.timeout_ms).toBe(1200000);
+    await admin(`/channels/${created.id}`, { name: 'Long streaming', kind: 'cloudflare', timeout_ms: 3600000 }, 'PUT');
+    expect((await admin<Channel[]>('/channels')).find(c => c.id === created.id)?.timeout_ms).toBe(3600000);
+    for (const timeout_ms of [999, 3600001]) expect((await request(`/api/channels/${created.id}`, { admin: true, method: 'PUT', body: { name: 'Long streaming', kind: 'cloudflare', timeout_ms } })).status).toBe(400);
+    expect((await admin<Channel[]>('/channels')).find(c => c.id === created.id)?.timeout_ms).toBe(3600000);
   });
 });
 

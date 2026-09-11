@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { invalid } from './errors';
+import { MAX_CHANNEL_TIMEOUT_MS } from '../../shared/channel-limits';
 
 export const nameSchema = z.string().trim().min(1).max(80);
 export const modelId = z.string().trim().min(1).max(160).regex(/^[a-zA-Z0-9@][a-zA-Z0-9._:/-]*$/, '模型 ID 只能包含字母、数字、点、下划线、斜线和短横线');
@@ -28,7 +29,7 @@ export const channelSchema = z.object({
   secret: z.string().trim().max(4096).optional(),
   credential_mode: z.enum(['local', 'byok']).optional(),
   enabled: z.boolean().default(true),
-  timeout_ms: z.number().int().min(1000).max(120000).default(60000),
+  timeout_ms: z.number().int().min(1000).max(MAX_CHANNEL_TIMEOUT_MS).default(60000),
   provider_id: z.string().max(100).optional(),
   provider_slug: z.string().trim().max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).optional(),
   gateway_path: z.string().trim().min(1).max(300).regex(/^[a-zA-Z0-9_/-]+$/, '请求路径只能包含字母、数字、下划线、短横线和斜线').optional(),

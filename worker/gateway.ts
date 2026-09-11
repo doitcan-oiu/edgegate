@@ -38,7 +38,7 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
   if (allowedTags.length && !available.length) throw new ApiError(403, 'model_not_allowed', '该密钥的标签范围内没有此模型的可用服务商');
   const limit = await consumeLimit(c.env, key.id, key.rpm, key.daily_limit);
   if (!limit.allowed) { c.header('Retry-After', String(limit.retryAfter)); throw new ApiError(429, 'rate_limited', '已达到请求频率或每日请求上限'); }
-  const requestId = c.get('requestId'), start = Date.now();
+  const requestId = c.get('requestId');
   let attempts = 0, channelsTried = 0;
   const candidates = orderCandidates(available, Math.random, settings.load_balancing);
   if (!candidates.length) { throw new ApiError(503, 'no_available_route', '此模型没有已配置且启用的渠道，请检查渠道凭据和模型路由'); }
@@ -46,7 +46,7 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
   let conversionError: ApiError | undefined;
   for (const candidate of candidates) {
     if (c.req.raw.signal.aborted) { throw new ApiError(499, 'client_disconnected', '客户端已断开连接'); }
-    if (Date.now() - start >= 180000 || channelsTried >= settings.cross_channel_retries + 1) break;
+    if (channelsTried >= settings.cross_channel_retries + 1) break;
     const upstreamProtocol = candidate.channel.protocol || 'openai';
     let converted: InferenceInput;
     try { converted = convertRequest(input, protocol, upstreamProtocol); }
@@ -55,11 +55,11 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
     for (let retry = 0; retry <= settings.same_channel_retries; retry++) {
       if (retry) await retryPause(Math.min(100 * 2 ** (retry - 1), 1000), c.req.raw.signal);
       if (c.req.raw.signal.aborted) throw new ApiError(499, 'client_disconnected', '客户端已断开连接');
-      if (Date.now() - start >= 180000) break;
       attempts++; c.header('X-Gateway-Attempts', String(attempts));
       const controller = new AbortController();
-      const remaining = Math.min(candidate.channel.timeout_ms, 180000 - (Date.now() - start));
-      const timer = setTimeout(() => controller.abort('upstream_timeout'), remaining);
+      // Each attempt gets its channel's full timeout, including the response body.
+      // Keep it alive through SSE completion instead of truncating long streams.
+      const timer = setTimeout(() => controller.abort('upstream_timeout'), candidate.channel.timeout_ms);
       const signal = AbortSignal.any([controller.signal, c.req.raw.signal]);
       let response: Response | undefined;
       let streaming = false;
@@ -92,7 +92,8 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
           headers.set('X-Accel-Buffering', 'no');
           const finish = () => { clearTimeout(timer); controller.abort(); };
           const onError = async (raw: string) => {
-            const failure = upstreamFailure(raw ? response!.status : null, raw || '上游流中断或包含无法转换的事件', 'upstream_stream_error');
+            const timedOut = controller.signal.reason === 'upstream_timeout';
+            const failure = upstreamFailure(raw ? response!.status : null, raw || (timedOut ? '上游流式请求超过渠道配置的总时限' : '上游流中断或包含无法转换的事件'), timedOut ? 'upstream_timeout' : 'upstream_stream_error');
             await remember(failure); return publicUpstreamError(settings, failure);
           };
           const body = protocol !== upstreamProtocol

@@ -28,7 +28,7 @@ export function RuntimeSettings({ initial }: { initial: GatewaySettings }) {
     <section className="runtime-section"><div className="runtime-section-heading"><h2>重试配置</h2><p>重试次数不包含首次请求。已尝试的渠道不会再次被选为新渠道。</p></div>
       <div className="runtime-columns"><Field label="单渠道最大重试次数" hint="0–5 次。临时故障时先重试当前渠道，再尝试其他渠道。"><Input type="number" required min={0} max={5} step={1} disabled={busy} value={value.same_channel_retries} onChange={event => setValue({ ...value, same_channel_retries: Number(event.target.value) })} /></Field>
       <Field label="跨渠道最大重试次数" hint="0–10 次。失败后最多切换多少个不同渠道；设为 0 则不切换。"><Input type="number" required min={0} max={10} step={1} disabled={busy} value={value.cross_channel_retries} onChange={event => setValue({ ...value, cross_channel_retries: Number(event.target.value) })} /></Field></div>
-      <div className="runtime-summary">最多尝试 <strong>{value.cross_channel_retries + 1}</strong> 个渠道、<strong>{(value.same_channel_retries + 1) * (value.cross_channel_retries + 1)}</strong> 次上游请求<span>受可用渠道数和 180 秒总时限限制</span></div>
+      <div className="runtime-summary">最多尝试 <strong>{value.cross_channel_retries + 1}</strong> 个渠道、<strong>{(value.same_channel_retries + 1) * (value.cross_channel_retries + 1)}</strong> 次上游请求<span>受可用渠道数限制，每次按渠道超时独立计时</span></div>
       <p className="runtime-hint">较高的重试次数可能增加延迟。鉴权失败、模型不可用会直接切换渠道；一般参数错误不重试。开始流式输出后不再重试。</p>
     </section>
     <section className="runtime-section"><div className="runtime-section-heading"><h2>上游错误展示</h2><p>控制 API 用户看到的报错内容，适用于普通响应和流式响应。</p></div>
