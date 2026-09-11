@@ -5,6 +5,8 @@ import { ArrowLeft, ArrowUpRight, ChevronLeft, ChevronRight, Pencil, Plus, Searc
 import type { Channel, CustomProvider, ProviderPage, ProviderProfile } from '../types';
 import { api, channelLabel, RefreshContext, ToastContext, useApi } from '../lib';
 import { ProviderFields, type ProviderFieldsHandle } from '../ProviderFields';
+import { ChannelAvailability } from '../ChannelAvailability';
+import type { ChannelAvailability as ChannelAvailabilityReport, ChannelAvailabilityResponse } from '../../shared/observability';
 import { Badge, Button, Confirm, Empty, ErrorBox, Field, Loading, Modal, PageTitle, Toggle, Input, Select, FormSection } from '../components';
 
 function ProviderPicker({ selected, onSelect }: { selected: string; onSelect: (provider: CustomProvider) => void }) {
@@ -91,42 +93,54 @@ function Providers({ channels }: { channels: Channel[] }) {
 type ChannelView = 'all' | 'openai' | 'anthropic' | 'configured' | 'pending' | 'disabled';
 const channelState = (channel: Channel) => !channel.enabled ? 'disabled' : channel.configured ? 'configured' : 'pending';
 const viewLabels: Record<ChannelView, string> = { all: '全部渠道', openai: 'OpenAI 兼容', anthropic: 'Anthropic', configured: '已配置', pending: '待配置', disabled: '已停用' };
-function ChannelEntry({ channel, onEdit, onDelete }: { channel: Channel; onEdit: () => void; onDelete: () => void }) {
-  const state = channelState(channel);
-  const credential = channel.has_secret ? '密钥已加密' : channel.byok_alias ? `BYOK · ${channel.byok_alias}` : channel.kind === 'openai' ? '待配置密钥' : null;
-  const provider = channel.provider_slug ? `custom-${channel.provider_slug}` : channelLabel[channel.kind];
-  const address = channel.base_url || provider;
-  return <article className={`channel-entry state-${state}`}>
+function ChannelEntry({ channel, availability, availabilityData, availabilityLoading, availabilityError, onEdit, onDelete }: {
+  channel: Channel; availability?: ChannelAvailabilityReport; availabilityData: ChannelAvailabilityResponse | null;
+  availabilityLoading: boolean; availabilityError: string; onEdit: (channel: Channel) => void; onDelete: () => void;
+}) {
+  const [enabled, setEnabled] = useState(!!channel.enabled), [saving, setSaving] = useState(false), [toggleError, setToggleError] = useState('');
+  const savingRef = useRef(false);
+  const { refresh } = useContext(RefreshContext), notify = useContext(ToastContext);
+  useEffect(() => { if (!savingRef.current) setEnabled(!!channel.enabled); }, [channel.enabled]);
+  async function toggle(value: boolean) {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    const previous = enabled;
+    setEnabled(value); setSaving(true); setToggleError('');
+    try {
+      const saved = await api<{ enabled: boolean }>(`/channels/${channel.id}`, { method: 'PATCH', body: JSON.stringify({ enabled: value }) });
+      setEnabled(saved.enabled);
+      refresh(); notify(`${channel.name} 已${value ? '启用' : '停用'}`);
+    } catch (err) { setEnabled(previous); setToggleError((err as Error).message); }
+    finally { savingRef.current = false; setSaving(false); }
+  }
+  return <article className={`channel-entry${enabled ? '' : ' is-disabled'}`}>
     <header className="channel-entry-heading">
-      <h3 title={channel.name}>{channel.name}</h3>
-      <span className={`entry-status is-${state}`}><i />{viewLabels[state]}</span>
+      <div className="channel-entry-title">
+        {!!channel.tags.length && <div className="entry-tags" aria-label="渠道标签">
+          {channel.tags.slice(0, 1).map(tag => <span key={tag} title={tag}>{tag}</span>)}
+          {channel.tags.length > 1 && <span title={channel.tags.slice(1).join('、')} aria-label={`其他标签：${channel.tags.slice(1).join('、')}`}>+{channel.tags.length - 1}</span>}
+        </div>}
+        <h3 title={channel.name}>{channel.name}</h3>
+      </div>
+      <span className={`entry-protocol is-${channel.protocol}`}>{channel.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容'}</span>
     </header>
     <div className="channel-entry-body">
-      <dl className="channel-entry-facts">
-        <div><dt>接口协议</dt><dd className={`entry-protocol is-${channel.protocol}`}>{channel.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容'}</dd></div>
-        {channel.kind === 'openai' && <div><dt>服务商模型</dt><dd className="entry-model-count"><strong>{channel.models.length}</strong><span>个</span></dd></div>}
-        <div className="channel-entry-endpoint"><dt>{channel.base_url ? '接入地址' : '服务商'}</dt><dd title={[provider, channel.base_url].filter(Boolean).join(' · ')}>{channel.base_url || channel.provider_slug ? <code>{address}</code> : address}</dd></div>
-      </dl>
-      {channel.kind === 'openai' && channel.models.length > 0 && <div className="channel-entry-models" aria-label="模型预览">
-        {channel.models.slice(0, 2).map(model => <code key={model} title={model}>{model}</code>)}
-        {channel.models.length > 2 && <span className="entry-more" title={channel.models.slice(2, 12).join('\n')}>+{channel.models.length - 2}</span>}
-      </div>}
-      {!!channel.tags.length && <div className="entry-tags" aria-label="渠道标签">
-        {channel.tags.slice(0, 3).map(tag => <span key={tag} title={tag}>{tag}</span>)}
-        {channel.tags.length > 3 && <span title={channel.tags.slice(3).join('、')}>+{channel.tags.length - 3}</span>}
-      </div>}
+      <ChannelAvailability report={availability} data={availabilityData} loading={availabilityLoading} error={availabilityError} />
+      <ErrorBox message={toggleError} />
     </div>
     <footer className="channel-entry-footer">
-      {credential && <span className="entry-credential" title={credential}>{credential}</span>}
+      <div className="entry-toggle" aria-busy={saving}><Toggle checked={enabled} onChange={toggle} disabled={saving} aria-label={`启用渠道 ${channel.name}`} label={saving ? '保存中…' : enabled ? '已启用' : '已停用'} /></div>
       <div className="channel-entry-operations">
-        <Button type="button" variant="ghost" className="entry-edit" aria-label={`编辑渠道 ${channel.name}`} onClick={onEdit}>编辑</Button>
-        <Button type="button" variant="ghost" className="entry-delete" aria-label={`删除渠道 ${channel.name}`} onClick={onDelete}>删除</Button>
+        <Button type="button" variant="ghost" className="entry-edit" disabled={saving} aria-label={`编辑渠道 ${channel.name}`} onClick={() => onEdit({ ...channel, enabled: +enabled })}>编辑</Button>
+        <Button type="button" variant="ghost" className="entry-delete" disabled={saving} aria-label={`删除渠道 ${channel.name}`} onClick={onDelete}>删除</Button>
       </div>
     </footer>
   </article>;
 }
 export function Channels() {
   const { data, error, loading } = useApi<Channel[]>('/channels');
+  const availability = useApi<ChannelAvailabilityResponse>('/channels/availability');
+  const availabilityByChannel = new Map(availability.data?.data.map(report => [report.channel_id, report]));
   const [showProviders, setShowProviders] = useState(false), [editing, setEditing] = useState<Channel | null | undefined>(), [deleting, setDeleting] = useState<Channel | null>(null);
   const [busy, setBusy] = useState(false), [deleteError, setDeleteError] = useState('');
   const { refresh } = useContext(RefreshContext), notify = useContext(ToastContext);
@@ -167,7 +181,7 @@ export function Channels() {
           <div className="channels-toolbar"><div className="channels-section-title"><h2>{viewLabels[view]}</h2><span>{filtered?.length ?? '—'}</span></div><div className="channels-search"><Search size={17} /><Input aria-label="搜索渠道" placeholder="搜索名称、地址或标签" value={search} onChange={e => { setSearch(e.target.value); setPage(1); }} />{search && <Button type="button" variant="ghost" className="icon-btn" aria-label="清除搜索" onClick={() => { setSearch(''); setPage(1); }}><X size={14} /></Button>}</div></div>
           <ErrorBox message={error} />
           {loading && !data ? <Loading /> : error && !data ? null : !visibleChannels?.length ? <Empty title={hasFilters ? '没有找到匹配的渠道' : '添加第一个渠道'} description={hasFilters ? '试试其他关键词，或清除当前筛选。' : '接入服务商后，在这里统一管理模型与连接。'} action={hasFilters ? <Button variant="secondary" onClick={clearFilters}>清除筛选</Button> : <Button onClick={() => setEditing(null)}><Plus size={17} />添加渠道</Button>} /> : <>
-            <div ref={directoryScroll} className="channels-entries" role="region" aria-label="供应商渠道" tabIndex={0}>{visibleChannels.map(channel => <ChannelEntry key={channel.id} channel={channel} onEdit={() => setEditing(channel)} onDelete={() => { setDeleting(channel); setDeleteError(''); }} />)}</div>
+            <div ref={directoryScroll} className="channels-entries" role="region" aria-label="供应商渠道" tabIndex={0}>{visibleChannels.map(channel => <ChannelEntry key={channel.id} channel={channel} availability={availabilityByChannel.get(channel.id)} availabilityData={availability.data} availabilityLoading={availability.loading} availabilityError={availability.error} onEdit={setEditing} onDelete={() => { setDeleting(channel); setDeleteError(''); }} />)}</div>
           <footer className="channels-pagination">
             <span className="channels-range">第 {offset + 1}–{Math.min(offset + pageSize, filtered?.length || 0)} 条，共 {filtered?.length || 0} 条</span>
             <div className="channels-pagination-controls"><Select aria-label="每页渠道数量" value={String(pageSize)} onChange={value => { setPageSize(Number(value)); setPage(1); }}><option value="20">20 条 / 页</option><option value="50">50 条 / 页</option><option value="100">100 条 / 页</option></Select><div className="channels-page-buttons"><Button variant="ghost" className="icon-btn" aria-label="上一页渠道" disabled={currentPage === 1 || loading} onClick={() => setPage(currentPage - 1)}><ChevronLeft size={17} /></Button><span aria-live="polite">{currentPage} <span>/ {totalPages}</span></span><Button variant="ghost" className="icon-btn" aria-label="下一页渠道" disabled={currentPage === totalPages || loading} onClick={() => setPage(currentPage + 1)}><ChevronRight size={17} /></Button></div></div>
@@ -175,7 +189,7 @@ export function Channels() {
           </>}
         </section>
       </div>
-      <footer className="channels-footnote"><p>配置状态仅反映连接配置，不代表上游实时可用性。</p><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">AI Gateway 接入文档<ArrowUpRight size={14} /></a></footer>
+      <footer className="channels-footnote"><p>可用率按已同步的非缓存请求统计，非实时探测。每块 2 分钟，灰色表示无有效记录，悬停查看详情。</p><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">AI Gateway 接入文档<ArrowUpRight size={14} /></a></footer>
     </div>
     {editing !== undefined && <ChannelForm channel={editing} onClose={() => setEditing(undefined)} />}
     {deleting && <Confirm title={`删除本地渠道 ${deleting.name}？`} description="此渠道、加密保存的密钥及其模型路由会被移除。Cloudflare 的服务商、已有 BYOK 密钥与日志会保留。" onConfirm={remove} onClose={() => setDeleting(null)} busy={busy} error={deleteError} />}

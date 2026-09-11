@@ -68,8 +68,8 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
   const id = useId(), labelId = `${id}-label`, hintId = hint ? `${id}-hint` : undefined;
   return <FieldContext.Provider value={{ id, labelId, hintId }}><div className="field"><Label htmlFor={id} id={labelId} className="field-label">{label}</Label>{children}{hint && <span id={hintId} className="field-hint">{hint}</span>}</div></FieldContext.Provider>;
 }
-export function Toggle({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (value: boolean) => void; label: string; disabled?: boolean }) {
-  return <Switch isSelected={checked} onChange={onChange} isDisabled={disabled} size="sm"><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>{label}</Label></Switch.Content></Switch>;
+export function Toggle({ checked, onChange, label, disabled = false, 'aria-label': ariaLabel }: { checked: boolean; onChange: (value: boolean) => void; label: string; disabled?: boolean; 'aria-label'?: string }) {
+  return <Switch isSelected={checked} onChange={onChange} isDisabled={disabled} aria-label={ariaLabel} size="sm"><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>{label}</Label></Switch.Content></Switch>;
 }
 export function Confirm({ title, description, onConfirm, onClose, busy, error }: { title: string; description: string; onConfirm: () => void; onClose: () => void; busy: boolean; error: string }) {
   return <Modal title={title} onClose={onClose} presentation="dialog"><p className="confirm-copy">{description}</p><ErrorBox message={error} /><div className="modal-actions"><Button variant="secondary" onClick={onClose} disabled={busy}>取消</Button><Button variant="danger" onClick={onConfirm} disabled={busy}>{busy ? '处理中…' : '确认操作'}</Button></div></Modal>;

@@ -35,6 +35,7 @@ export const channelSchema = z.object({
   gateway_path: z.string().trim().min(1).max(300).regex(/^[a-zA-Z0-9_/-]+$/, '请求路径只能包含字母、数字、下划线、短横线和斜线').optional(),
   byok_alias: z.string().trim().max(100).regex(/^[a-zA-Z0-9_-]*$/).default(''),
 });
+export const channelStateSchema = z.object({ enabled: z.boolean() }).strict();
 export const providerSchema = z.object({
   ...profileSchema.shape,
   name: nameSchema,

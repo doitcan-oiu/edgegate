@@ -6,6 +6,9 @@ import { Miniflare, convertV4MiniflareOptions, Response as MFResponse, type Requ
 import { decryptSecret, encryptSecret } from '../worker/lib/crypto';
 import { orderCandidates } from '../worker/upstream';
 import { safeBaseUrl } from '../worker/lib/validation';
+import { getChannelAvailability } from '../worker/channel-availability';
+import { normalizeLog } from '../worker/cloudflare-observability';
+import type { ChannelAvailabilityResponse } from '../shared/observability';
 import type { Candidate, Channel, Env, Model, Route } from '../worker/types';
 import worker from '../worker/index';
 import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings, type UpstreamErrorTrace } from '../shared/gateway-settings';
@@ -167,6 +170,39 @@ describe('access control', () => {
   });
   it('rejects oversized inference bodies before reaching Cloudflare', async () => {
     expect((await chat((await key()).key, { messages: [{ role: 'user', content: 'a'.repeat(2 * 1024 * 1024) }] })).status).toBe(413); expect(calls).toHaveLength(0);
+  });
+});
+
+describe('channel enable switches', () => {
+  it('changes only channel state, works without CF, and immediately affects routing', async () => {
+    const before = (await db.prepare("SELECT * FROM channels WHERE name = 'Primary'").first<Channel>())!;
+    const routes = (await db.prepare('SELECT * FROM routes').all()).results;
+    const profiles = (await db.prepare('SELECT * FROM provider_profiles').all()).results;
+    const token = (await key()).key;
+    controlCalls = []; controlFailure = 503;
+    expect(await admin(`/channels/${before.id}`, { enabled: false }, 'PATCH')).toEqual({ enabled: false });
+    expect(await admin(`/channels/${before.id}`, { enabled: false }, 'PATCH')).toEqual({ enabled: false });
+    expect(await db.prepare('SELECT * FROM channels WHERE id = ?').bind(before.id).first()).toEqual({ ...before, enabled: 0 });
+    expect(await visibleModels(token)).toEqual([]);
+    expect((await chat(token)).status).toBe(503); expect(calls).toHaveLength(0);
+    expect(await admin(`/channels/${before.id}`, { enabled: true }, 'PATCH')).toEqual({ enabled: true });
+    expect(await visibleModels(token)).toEqual(['test-model']);
+    const response = await chat(token); expect(response.status).toBe(200); await response.text();
+    expect(await db.prepare('SELECT * FROM channels WHERE id = ?').bind(before.id).first()).toEqual(before);
+    expect((await db.prepare('SELECT * FROM routes').all()).results).toEqual(routes);
+    expect((await db.prepare('SELECT * FROM provider_profiles').all()).results).toEqual(profiles);
+    expect(controlCalls).toHaveLength(0);
+  });
+  it('requires an explicit boolean and rejects unrelated fields and unauthorized changes', async () => {
+    const channel = (await db.prepare("SELECT id FROM channels WHERE name = 'Primary'").first<{ id: string }>())!;
+    const path = `/api/channels/${channel.id}`;
+    for (const body of [{}, { enabled: 'false' }, { enabled: 0 }, { enabled: null }, { enabled: false, name: 'changed' }]) {
+      expect((await request(path, { admin: true, method: 'PATCH', body })).status).toBe(400);
+    }
+    expect((await request(path, { method: 'PATCH', body: { enabled: false } })).status).toBe(401);
+    expect((await request(path, { admin: true, method: 'PATCH', body: { enabled: false }, headers: { Origin: 'https://evil.example' } })).status).toBe(403);
+    expect((await request('/api/channels/missing', { admin: true, method: 'PATCH', body: { enabled: false } })).status).toBe(404);
+    expect(await db.prepare('SELECT enabled FROM channels WHERE id = ?').bind(channel.id).first()).toEqual({ enabled: 1 });
   });
 });
 
@@ -362,6 +398,77 @@ async function runSync(force = false) {
 }
 
 describe('Cloudflare observability synchronized to D1', () => {
+  it('keeps stable channel IDs in cached logs without guessing from names', () => {
+    expect(normalizeLog(logFixture({ metadata: JSON.stringify({ channel_id: 'channel-a', channel_name: 'Same name' }) }))).toMatchObject({ channel_id: 'channel-a', channel_name: 'Same name' });
+    expect(normalizeLog(logFixture())).toMatchObject({ channel_id: null, channel_name: 'Primary' });
+    expect(normalizeLog(logFixture({ metadata: '{invalid' }))).toMatchObject({ channel_id: null });
+  });
+  it('aggregates channel availability from D1 by stable ID, preserving attempt outcomes and sync errors', async () => {
+    const primary = (await db.prepare("SELECT id FROM channels WHERE name = 'Primary'").first<{ id: string }>())!.id;
+    const fallback = await channel('Fallback', 'fallback.example.com');
+    await db.prepare("UPDATE channels SET name = 'Same name'").run();
+    const created_at = new Date(Date.now() - 60000).toISOString();
+    const metadata = (channel_id: string) => JSON.stringify({ channel_id, channel_name: 'Old name', request_id: 'same-request' });
+    remoteLogs = [
+      logFixture({ id: 'a-ok', metadata: metadata(primary), created_at, status_code: undefined }),
+      logFixture({ id: 'a-fail', metadata: metadata(primary), created_at, success: false, status_code: 503 }),
+      logFixture({ id: 'a-cached', metadata: metadata(primary), created_at, cached: true }),
+      logFixture({ id: 'b-ok', metadata: metadata(fallback), created_at }),
+      logFixture({ id: 'unattributed', created_at }),
+    ];
+    await runSync(); controlCalls = []; controlFailure = 503;
+    await db.prepare("UPDATE observability_jobs SET last_error = '暂时无法同步', last_success_at = ? WHERE job = 'logs:head'").bind(new Date(Date.now() - 600000).toISOString()).run();
+    const result = await admin<ChannelAvailabilityResponse>('/channels/availability');
+    expect(result).toMatchObject({ storage: 'd1', sync: { state: 'error', stale: true } });
+    const a = result.data.find(row => row.channel_id === primary)!;
+    expect(a).toMatchObject({ requests: 2, successes: 1, rate: 0.5 });
+    expect(a.buckets).toHaveLength(30);
+    expect(a.buckets.filter(row => row.requests)).toEqual([expect.objectContaining({ requests: 2, successes: 1, rate: 0.5 })]);
+    expect(result.data.find(row => row.channel_id === fallback)).toMatchObject({ requests: 1, successes: 1, rate: 1 });
+    expect(controlCalls).toEqual([]);
+    expect((await request('/api/channels/availability')).status).toBe(401);
+    controlFailure = 0; remoteLogs[1].success = true; remoteLogs[1].status_code = 200;
+    await runSync(true);
+    expect((await admin<ChannelAvailabilityResponse>('/channels/availability')).data.find(row => row.channel_id === primary)).toMatchObject({ requests: 2, successes: 2, rate: 1 });
+  });
+  it('bounds availability to one hour in two-minute buckets with empty, unknown and foreign records excluded', async () => {
+    const primary = (await db.prepare("SELECT id FROM channels WHERE name = 'Primary'").first<{ id: string }>())!.id;
+    const empty = await channel('Empty', 'empty.example.com');
+    const end = Date.parse('2026-09-12T06:00:00.000Z'), start = end - 3600000;
+    const scope = JSON.stringify(['v1', account, 'test-gateway']);
+    const cases = [
+      { id: 'too-old', at: start - 1 }, { id: 'first', at: start }, { id: 'last-in-first', at: start + 120000 - 1, success: false },
+      { id: 'second', at: start + 120000, success: false }, { id: 'last', at: end - 1 }, { id: 'future', at: end },
+      { id: 'foreign', at: start, scope: 'other-gateway' }, { id: 'unknown', at: start, success: null },
+      { id: 'old-payload', at: start, channel_id: null }, { id: 'deleted-channel', at: start, channel_id: 'deleted' },
+      { id: 'cached', at: start, cached: 1 },
+    ];
+    await db.batch(cases.map(row => db.prepare('INSERT INTO observability_logs (scope,id,created_at,success,upstream_model,payload,synced_at) VALUES (?,?,?,?,?,?,?)').bind(
+      row.scope || scope, row.id, new Date(row.at).toISOString(), row.success === false ? 0 : 1, 'cloud-model',
+      JSON.stringify({ channel_id: row.channel_id === undefined ? primary : row.channel_id, success: row.success === undefined ? true : row.success, cached: row.cached || 0 }), new Date(end).toISOString(),
+    )));
+    const env = { DB: db, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway' } as unknown as Env;
+    const result = await getChannelAvailability(env, end);
+    expect(result).toMatchObject({ window_start: new Date(start).toISOString(), window_end: new Date(end).toISOString(), backfilling: true });
+    const a = result.data.find(row => row.channel_id === primary)!;
+    expect(a).toMatchObject({ requests: 4, successes: 2, rate: 0.5 });
+    expect(a.buckets[0]).toMatchObject({ requests: 2, successes: 1, rate: 0.5 });
+    expect(a.buckets[1]).toMatchObject({ requests: 1, successes: 0, rate: 0 });
+    expect(a.buckets[29]).toMatchObject({ requests: 1, successes: 1, rate: 1 });
+    expect(a.buckets.slice(2, 29).every(row => row.requests === 0 && row.rate === null)).toBe(true);
+    expect(result.data.find(row => row.channel_id === empty)).toMatchObject({ requests: 0, rate: null });
+    expect(controlCalls.filter(call => call.url.includes('/logs'))).toEqual([]);
+  });
+  it('exposes repair failures even when recent logs and historical coverage are current', async () => {
+    await runSync();
+    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify({ covered_from: new Date(Date.now() - 90 * 60000).toISOString(), covered_to: new Date().toISOString() })).run();
+    await db.prepare("UPDATE observability_jobs SET cursor = NULL, last_error = '旧日志修复失败' WHERE job = 'logs:repair'").run();
+    const result = await admin<ChannelAvailabilityResponse>('/channels/availability');
+    expect(result).toMatchObject({ backfilling: false, sync: { state: 'ready', stale: false } });
+    expect(result.jobs.find(job => job.job === 'logs:repair')).toMatchObject({ state: 'error', last_error: '旧日志修复失败' });
+    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify({ covered_from: new Date(Date.now() - 30 * 60000).toISOString(), covered_to: new Date().toISOString() })).run();
+    expect(await admin('/channels/availability')).toMatchObject({ backfilling: true });
+  });
   it('reads paginated cached logs without contacting Cloudflare, preserving metadata correlation', async () => {
     remoteLogs = Array.from({ length: 26 }, (_, i) => logFixture({ id: `remote-${i}`, created_at: new Date(Date.now() - i * 1000).toISOString() }));
     await runSync(); controlCalls = [];

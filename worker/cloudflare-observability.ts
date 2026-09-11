@@ -14,7 +14,7 @@ export function normalizeLog(log: GatewayLog) {
   const text = (key: string) => typeof metadata?.[key] === 'string' ? metadata[key] as string : null;
   return {
     id: log.id, request_id: text('request_id'), model: text('model_alias') || log.model,
-    channel_name: text('channel_name') || log.provider, key_name: text('key_name') || '外部调用',
+    channel_id: text('channel_id'), channel_name: text('channel_name') || log.provider, key_name: text('key_name') || '外部调用',
     status: log.status_code ?? null, success: log.success, latency_ms: log.duration,
     input_tokens: log.tokens_in ?? null, output_tokens: log.tokens_out ?? null, cost_usd: log.cost ?? null,
     cached: +log.cached, stream: log.response_content_type?.includes('text/event-stream') ? 1 : 0,

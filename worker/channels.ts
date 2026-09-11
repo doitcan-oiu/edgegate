@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Channel, Env } from './types';
 import { ApiError, invalid } from './lib/errors';
 import { encryptionConfigured, encryptSecret, randomToken } from './lib/crypto';
-import { channelSchema, providerSchema, safeBaseUrl } from './lib/validation';
+import { channelSchema, channelStateSchema, providerSchema, safeBaseUrl } from './lib/validation';
 import { channelConfigured } from './upstream';
 import { profile, profiles, saveProfile, syncCatalog } from './providers';
 import { cfApi, providerPath, publicProvider, type CustomProvider } from './cloudflare';
@@ -109,6 +109,13 @@ channels.post('/channels', async c => {
     else await syncCatalog(c.env, custom.provider.id);
   }
   return c.json({ id }, 201);
+});
+channels.patch('/channels/:id', async c => {
+  const data = channelStateSchema.parse(await c.req.json());
+  const result = await c.env.DB.prepare('UPDATE channels SET enabled = ? WHERE id = ?')
+    .bind(+data.enabled, c.req.param('id')).run();
+  if (!result.meta.changes) throw new ApiError(404, 'not_found', '渠道不存在');
+  return c.json({ enabled: data.enabled });
 });
 channels.put('/channels/:id', async c => {
   const id = c.req.param('id');

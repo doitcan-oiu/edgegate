@@ -5,6 +5,7 @@ import { encryptionConfigured, randomToken, sha256 } from './lib/crypto';
 import { modelSchema, routeSchema, keySchema } from './lib/validation';
 import { channels } from './channels';
 import { logs, logDetail, stats } from './observability';
+import { channelAvailability } from './channel-availability';
 import { getGatewaySettings, saveGatewaySettings } from './settings';
 import { getErrorTraces } from './upstream-errors';
 import { checkRouteScope, readRouteScope, requireGlobalModelScope, scopeCondition } from './route-scope';
@@ -29,6 +30,7 @@ admin.get('/traces/:requestId', async c => {
   if (!/^[a-f0-9-]{36}$/i.test(requestId)) throw invalid('请输入有效的 EdgeGate 请求 ID');
   return c.json(await getErrorTraces(c.env, requestId));
 });
+admin.get('/channels/availability', channelAvailability);
 admin.route('/', channels);
 admin.get('/models', async c => {
   const scope = readRouteScope(c), condition = scopeCondition(scope, 'channel_id');
