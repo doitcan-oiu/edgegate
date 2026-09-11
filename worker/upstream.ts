@@ -2,6 +2,7 @@ import type { Candidate, Channel, Env, Route } from './types';
 import { decryptSecret, encryptionConfigured } from './lib/crypto';
 import type { InferenceInput } from './protocols/convert';
 import { inferenceToken } from './cloudflare';
+import type { GatewaySettings } from '../shared/gateway-settings';
 
 export function channelConfigured(channel: Channel, env: Env) {
   if (channel.kind === 'openai') return /^[a-f0-9]{32}$/i.test(env.CLOUDFLARE_ACCOUNT_ID || '') && !!inferenceToken(env) && !!channel.provider_id && !!channel.provider_slug &&
@@ -9,15 +10,25 @@ export function channelConfigured(channel: Channel, env: Env) {
   const token = channel.kind === 'cloudflare' ? env.CF_AI_TOKEN : inferenceToken(env);
   return /^[a-f0-9]{32}$/i.test(env.CLOUDFLARE_ACCOUNT_ID || '') && !!(channel.secret_encrypted || token);
 }
-export function orderCandidates(candidates: Candidate[], random = Math.random): Candidate[] {
-  // Weighted sampling without replacement within each priority tier.
+export function orderCandidates(candidates: Candidate[], random = Math.random, strategy: GatewaySettings['load_balancing'] = 'weighted'): Candidate[] {
+  // Priority wins first. A failed channel cannot re-enter via another route.
   const pending = [...candidates], result: Candidate[] = [];
   while (pending.length) {
     const priority = Math.min(...pending.map(r => r.priority));
     const tier = pending.filter(r => r.priority === priority);
-    let choice = random() * tier.reduce((sum, r) => sum + r.weight, 0);
-    const selected = tier.find(r => (choice -= r.weight) < 0) || tier[tier.length - 1];
-    result.push(selected); pending.splice(pending.indexOf(selected), 1);
+    const channelId = (r: Candidate) => r.channel_id || r.id;
+    let selected: Candidate;
+    if (strategy === 'random') {
+      const channelIds = [...new Set(tier.map(channelId))];
+      const channel = channelIds[Math.min(channelIds.length - 1, Math.floor(random() * channelIds.length))];
+      const routes = tier.filter(r => channelId(r) === channel);
+      selected = routes[Math.min(routes.length - 1, Math.floor(random() * routes.length))];
+    } else {
+      let choice = random() * tier.reduce((sum, r) => sum + r.weight, 0);
+      selected = tier.find(r => (choice -= r.weight) < 0) || tier[tier.length - 1];
+    }
+    result.push(selected);
+    for (let i = pending.length - 1; i >= 0; i--) if (channelId(pending[i]) === channelId(selected)) pending.splice(i, 1);
   }
   return result;
 }

@@ -139,7 +139,7 @@ export function Channels() {
   useEffect(() => { setPage(previous => Math.min(previous, totalPages)); }, [totalPages]);
   useEffect(() => { if (directoryScroll.current) directoryScroll.current.scrollTop = 0; }, [currentPage, pageSize, search, view]);
   if (showProviders) return <>
-    <PageTitle eyebrow="02 / CONNECTIONS" title="Cloudflare 账户资源" description="管理账户级服务商的名称、状态和生命周期。日常连接与模型配置可在渠道中完成。" action={<Button variant="secondary" onClick={() => setShowProviders(false)}><ArrowLeft size={16} />返回渠道管理</Button>} />
+    <PageTitle title="Cloudflare 账户资源" description="管理账户级服务商的名称、状态和生命周期。日常连接与模型配置可在渠道中完成。" action={<Button variant="secondary" onClick={() => setShowProviders(false)}><ArrowLeft size={16} />返回渠道管理</Button>} />
     <Providers channels={data || []} />
   </>;
   const configuredCount = data?.filter(channel => channel.enabled && channel.configured).length;

@@ -1,5 +1,6 @@
 import type { Protocol } from '../types';
 import { anthropicStop, anthropicUsage, badResponse, openaiStop, openaiUsage, type ObjectValue } from './convert';
+import { streamErrorEvent, UpstreamStreamError, type StreamErrorHandler } from './error-stream';
 
 const encoder = new TextEncoder();
 const maxEvent = 1024 * 1024;
@@ -33,7 +34,7 @@ async function* anthropicToOpenAI(body: ReadableStream<Uint8Array>, includeUsage
   const chunk = (delta: ObjectValue, finish: string | null = null) => data({ id, model, created, object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason: finish, logprobs: null }] });
   for await (const payload of frames(body)) {
     const value = JSON.parse(payload) as ObjectValue;
-    if (value.type === 'error') throw badResponse();
+    if (value.type === 'error') throw new UpstreamStreamError(payload);
     if (value.type === 'ping') continue;
     if (value.type === 'message_start') {
       if (started || !value.message?.id) throw badResponse();
@@ -94,7 +95,8 @@ async function* openaiToAnthropic(body: ReadableStream<Uint8Array>) {
       yield event('message_stop', {}); return;
     }
     const value = JSON.parse(payload) as ObjectValue;
-    if (value.error || !Array.isArray(value.choices)) throw badResponse();
+    if (value.error) throw new UpstreamStreamError(payload);
+    if (!Array.isArray(value.choices)) throw badResponse();
     if (!started) {
       if (!value.id || !value.model) throw badResponse();
       started = true;
@@ -139,15 +141,19 @@ async function* openaiToAnthropic(body: ReadableStream<Uint8Array>) {
   }
   throw badResponse();
 }
-export function convertStream(body: ReadableStream<Uint8Array>, from: Protocol, to: Protocol, includeUsage: boolean, finish: () => void) {
+export function convertStream(body: ReadableStream<Uint8Array>, from: Protocol, to: Protocol, includeUsage: boolean, finish: () => void, onError?: StreamErrorHandler, requestId = '') {
   const iterator = (from === 'anthropic' ? anthropicToOpenAI(body, includeUsage) : openaiToAnthropic(body))[Symbol.asyncIterator]();
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
         const next = await iterator.next();
         if (next.done) { finish(); controller.close(); } else controller.enqueue(encoder.encode(next.value));
-      } catch {
+      } catch (caught) {
         finish(); await iterator.return?.();
+        if (onError) {
+          controller.enqueue(encoder.encode(streamErrorEvent(await onError(caught instanceof UpstreamStreamError ? caught.raw : ''), to, requestId)));
+          controller.close(); return;
+        }
         const error = { type: 'api_error', message: '上游流中断或包含无法转换的事件，请通过请求 ID 查看 Cloudflare 日志' };
         controller.enqueue(encoder.encode(to === 'anthropic' ? event('error', { error }) : data({ error })));
         controller.close();

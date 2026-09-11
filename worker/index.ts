@@ -6,6 +6,7 @@ import { ApiError } from './lib/errors';
 import { checkOrigin, login, logout, requireAdmin } from './auth';
 import { admin } from './admin';
 import { chat, listModels } from './gateway';
+import { ERROR_RETENTION_DAYS } from './upstream-errors';
 
 const app = new Hono<AppEnv>();
 app.use('*', async (c, next) => {
@@ -41,6 +42,7 @@ app.onError((error, c) => {
   return new Response(JSON.stringify(anthropic ? { type: 'error', error: { type, message }, request_id: c.get('requestId') } : { error: { message, type: code, code, request_id: c.get('requestId') } }), {
     status, headers: { 'Content-Type': 'application/json', 'Cache-Control': 'no-store', 'X-Request-ID': c.get('requestId'),
       ...(c.res.headers.get('Retry-After') ? { 'Retry-After': c.res.headers.get('Retry-After')! } : {}),
+      ...(c.res.headers.get('X-Gateway-Attempts') ? { 'X-Gateway-Attempts': c.res.headers.get('X-Gateway-Attempts')! } : {}),
     },
   });
 });
@@ -48,5 +50,6 @@ export default {
   fetch: app.fetch,
   async scheduled(_event: ScheduledController, env: Env, ctx: ExecutionContext) {
     ctx.waitUntil(env.DB.prepare('DELETE FROM key_counters WHERE day < ?').bind(Math.floor(Date.now() / 86400000) - 2).run());
+    ctx.waitUntil(env.DB.prepare('DELETE FROM upstream_error_traces WHERE created_at < ?').bind(new Date(Date.now() - ERROR_RETENTION_DAYS * 86400000).toISOString()).run());
   },
 } satisfies ExportedHandler<Env>;

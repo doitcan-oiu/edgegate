@@ -193,7 +193,7 @@ curl https://YOUR-WORKER.workers.dev/v1/messages \
 
 ## 日志与分析
 
-日志数据来自 Cloudflare，不在 D1 重复存储：
+推理日志与用量统计来自 Cloudflare；D1 仅额外保留上游错误追踪，不复制完整推理日志或请求正文：
 
 ```text
 GET /client/v4/accounts/{account}/ai-gateway/gateways/{gateway}/logs
@@ -208,7 +208,8 @@ POST /client/v4/graphql
 - 通过 `cf-aig-metadata` 传递请求 ID、应用 Key ID/名称、模型别名、渠道与尝试序号。返回 `X-Request-ID`、`X-Gateway-Attempts`，以及上游提供的 `cf-aig-log-id`，便于关联。
 - Worker 不再强制关闭 AI Gateway 日志或缓存。正文是否采集、日志保留期限、缓存和 Custom costs 由 Cloudflare 网关设置决定。完整请求/响应正文目前在 Cloudflare 控制台查看。
 - Cloudflare 分析可能延迟或采样，部分自定义服务商无法自动提供 Token / 成本；本程序不会自行补算。需要补充单价时在 Cloudflare 配置 Custom costs。
-- Worker 提前拒绝的鉴权、配额或路由错误没有到达 AI Gateway，因此不会出现在 AI Gateway 推理日志中。Worker 自身运行异常仍可通过 Cloudflare Workers Observability 排查。
+- 「请求日志 → 请求追踪」可按响应中的 `X-Request-ID` 查询每次失败的原始错误；普通响应、流式错误与连接失败均会记录。追踪只对管理员开放，保留 7 天，每条最多 16 KiB，超长或未完整读取会标记截断。Cloudflare 日志详情也会关联对应的原始错误。客户端错误展示设置不影响这些记录。
+- Worker 提前拒绝的鉴权、配额或路由错误没有到达 AI Gateway，因此不会出现在 AI Gateway 推理日志或上游错误追踪中。Worker 自身运行异常仍可通过 Cloudflare Workers Observability 排查。
 
 ## 升级旧版直连配置
 
@@ -218,7 +219,7 @@ npm run db:migrate          # 本地
 npm run db:migrate:remote
 ```
 
-`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。定时任务现在只清理过期配额计数。
+`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。定时任务清理过期配额计数及超过 7 天的错误追踪。
 
 旧「OpenAI 兼容」直连渠道会显示待配置，**不会继续直连供应商**。编辑渠道，将其关联到 Cloudflare 服务商，并确认请求路径。仅当完整上游 URL 与旧地址完全一致时，才会保留原有加密 Key；目的地不一致需重新输入密钥或提供已有 BYOK 别名。关联后推理经过 AI Gateway，密钥继续加密保存在 D1。
 
@@ -245,7 +246,13 @@ npm run deploy
 
 ## 路由与配额
 
-路由按优先级从小到大选择，同级按权重随机选择；每条候选最多一次、最多 5 条，总时限 180 秒，单渠道完整响应超时最多 120 秒。上游认证、限流、不可用模型、5xx、连接失败可故障转移；一般参数错误不重试。开始向客户端输出 SSE 后不再重试。断连或重试仍可能产生上游费用。
+在「网关设置 → 程序设置」配置负载均衡、重试与错误展示。设置保存在 D1，保存后对新请求生效，进行中的请求使用开始时的配置。
+
+- 负载均衡：始终优先选择较低优先级。同级支持「多渠道随机」（不同渠道等概率）或「按照权重」（按路由权重抽样）；同一渠道的多条路由不会被重复视为新渠道。
+- 单渠道重试 0–5 次，跨渠道重试 0–10 次，均不包含首次请求。默认按权重、单渠道重试 0 次、跨渠道重试 4 次。最多尝试 `(单渠道重试 + 1) × (跨渠道重试 + 1)` 次，并受可用渠道数及 180 秒总时限限制。
+- 408、409、429、5xx、连接失败或无效响应可先在当前渠道重试，短暂递增退避后再发起请求；当前渠道耗尽次数再切换。401、403、404 直接切换到不同渠道，一般参数错误不重试。单渠道完整响应超时最多 120 秒，开始输出 SSE 后不再重试。断连或重试仍可能产生上游费用。
+- 上游错误展示支持显示原始错误、隐藏细节（默认）和自定义提示，涵盖 OpenAI / Anthropic 普通及流式响应。自定义规则优先精确匹配供应商错误码（含数字码），其次匹配上游 HTTP 状态码，再匹配网关上游错误类别（例如 `upstream_timeout`）；未匹配时隐藏细节。规则只改变对外提示，不改变 HTTP 状态、路由或重试判定。
+- 管理接口：`GET /api/config` 返回 `runtime` 配置；`PUT /api/config/runtime` 完整更新配置，校验取值范围和重复错误码。`GET /api/traces/{request-id}` 查询管理员错误追踪。
 
 D1 通过原子条件更新执行每个应用 Key 的每分钟 / 每日请求限额，使用 UTC 固定窗口；授权且格式有效的请求在路由前消耗一次配额，重试不重复计数。撤销立即影响后续鉴权，进行中的请求继续完成。KV 会话单独退出的跨区域传播受最终一致性影响，并有显式 24 小时到期限制。
 

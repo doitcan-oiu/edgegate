@@ -3,6 +3,8 @@ import type { AppEnv, Env } from './types';
 import { cfApi, cfGraphql, accountId, gatewayId, gatewayPath } from './cloudflare';
 import { ApiError } from './lib/errors';
 import { sha256 } from './lib/crypto';
+import type { UpstreamErrorTrace } from '../shared/gateway-settings';
+import { ERROR_RETENTION_DAYS } from './upstream-errors';
 
 interface GatewayLog {
   id: string; created_at: string; duration: number; model: string; provider: string; success: boolean;
@@ -40,7 +42,11 @@ export async function logs(c: Context<AppEnv>) {
 }
 export async function logDetail(c: Context<AppEnv>) {
   const response = await cfApi<GatewayLog>(c.env, `${gatewayPath(c.env)}/logs/${encodeURIComponent(c.req.param('id')!)}`);
-  return c.json(normalizeLog(response.result));
+  const detail = normalizeLog(response.result);
+  const cutoff = new Date(Date.now() - ERROR_RETENTION_DAYS * 86400000).toISOString();
+  const byLog = await c.env.DB.prepare('SELECT * FROM upstream_error_traces WHERE cf_log_id = ? AND created_at >= ? LIMIT 1').bind(detail.id, cutoff).first<UpstreamErrorTrace>();
+  const error = byLog || (detail.request_id && detail.attempts ? await c.env.DB.prepare('SELECT * FROM upstream_error_traces WHERE request_id = ? AND attempt = ? AND created_at >= ?').bind(detail.request_id, detail.attempts, cutoff).first<UpstreamErrorTrace>() : null);
+  return c.json({ ...detail, upstream_error: error });
 }
 
 type Metrics = { tokensIn?: number; tokensOut?: number; cost?: number; erroredRequests?: number; cachedRequests?: number };

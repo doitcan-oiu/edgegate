@@ -5,9 +5,12 @@ import { encryptionConfigured, randomToken, sha256 } from './lib/crypto';
 import { modelSchema, routeSchema, keySchema } from './lib/validation';
 import { channels } from './channels';
 import { logs, logDetail, stats } from './observability';
+import { getGatewaySettings, saveGatewaySettings } from './settings';
+import { getErrorTraces } from './upstream-errors';
 
 export const admin = new Hono<AppEnv>();
-admin.get('/config', c => c.json({
+admin.get('/config', async c => c.json({
+  runtime: await getGatewaySettings(c.env),
   account_id: c.env.CLOUDFLARE_ACCOUNT_ID || '', gateway_id: c.env.AI_GATEWAY_ID || 'default',
   ai_token_configured: !!c.env.CF_AI_TOKEN, aig_token_configured: !!c.env.CF_AIG_TOKEN,
   encryption_configured: encryptionConfigured(c.env.ENCRYPTION_KEY),
@@ -15,6 +18,12 @@ admin.get('/config', c => c.json({
   observability_source: 'cloudflare',
   dashboard_url: `https://dash.cloudflare.com/${c.env.CLOUDFLARE_ACCOUNT_ID || ''}/ai/ai-gateway`,
 }));
+admin.put('/config/runtime', async c => c.json(await saveGatewaySettings(c.env, await c.req.json())));
+admin.get('/traces/:requestId', async c => {
+  const requestId = c.req.param('requestId');
+  if (!/^[a-f0-9-]{36}$/i.test(requestId)) throw invalid('请输入有效的 EdgeGate 请求 ID');
+  return c.json(await getErrorTraces(c.env, requestId));
+});
 admin.route('/', channels);
 admin.get('/models', async c => {
   const [models, routes] = await Promise.all([

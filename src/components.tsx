@@ -1,6 +1,7 @@
+import { ErrorTrace } from './ErrorTrace';
 import { Children, createContext, isValidElement, useContext, useId, type ReactNode, type ComponentProps, type InputHTMLAttributes, type TextareaHTMLAttributes, type OptionHTMLAttributes } from 'react';
 import { Button as HeroButton, Checkbox as HeroCheckbox, Chip, Input as HeroInput, Label, ListBox, Modal as HeroModal, Select as HeroSelect, Spinner, Switch, TextArea as HeroTextArea } from '@heroui/react';
-import { AlertCircle, Check, CheckCircle2, ChevronRight, Copy, Inbox, ArrowUpRight, Zap } from 'lucide-react';
+import { AlertCircle, Check, CheckCircle2, ChevronRight, Copy, Inbox, Zap } from 'lucide-react';
 import type { Log } from './types';
 import { compact, money, time, useApi } from './lib';
 
@@ -37,8 +38,8 @@ export function Select({ children, value, onChange, disabled, required, 'aria-la
 export function Checkbox({ checked, onChange, children }: { checked: boolean; onChange: (value: boolean) => void; children: ReactNode }) {
   return <HeroCheckbox isSelected={checked} onChange={onChange} className="permission-check"><HeroCheckbox.Content><HeroCheckbox.Control><HeroCheckbox.Indicator /></HeroCheckbox.Control><Label>{children}</Label></HeroCheckbox.Content></HeroCheckbox>;
 }
-export function PageTitle({ eyebrow, title, description, action }: { eyebrow: string; title: string; description: string; action?: ReactNode }) {
-  return <header className="page-heading"><div className="page-title-block"><div className="eyebrow"><span />{eyebrow}</div><h1>{title}</h1><p>{description}</p></div>{action && <div className="page-actions">{action}</div>}</header>;
+export function PageTitle({ title, description, action }: { title: string; description: string; action?: ReactNode }) {
+  return <header className="page-heading"><div className="page-title-block"><h1>{title}</h1><p>{description}</p></div>{action && <div className="page-actions">{action}</div>}</header>;
 }
 export function Badge({ children, tone = 'neutral' }: { children: ReactNode; tone?: 'green' | 'amber' | 'red' | 'neutral' }) {
   return <Chip size="sm" variant="soft" color={({ green: 'success', amber: 'warning', red: 'danger', neutral: 'default' } as const)[tone]} className="badge"><span className="status-dot" /><Chip.Label>{children}</Chip.Label></Chip>;
@@ -67,8 +68,8 @@ export function Field({ label, hint, children }: { label: string; hint?: string;
   const id = useId(), labelId = `${id}-label`, hintId = hint ? `${id}-hint` : undefined;
   return <FieldContext.Provider value={{ id, labelId, hintId }}><div className="field"><Label htmlFor={id} id={labelId} className="field-label">{label}</Label>{children}{hint && <span id={hintId} className="field-hint">{hint}</span>}</div></FieldContext.Provider>;
 }
-export function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (value: boolean) => void; label: string }) {
-  return <Switch isSelected={checked} onChange={onChange} size="sm"><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>{label}</Label></Switch.Content></Switch>;
+export function Toggle({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (value: boolean) => void; label: string; disabled?: boolean }) {
+  return <Switch isSelected={checked} onChange={onChange} isDisabled={disabled} size="sm"><Switch.Content><Switch.Control><Switch.Thumb /></Switch.Control><Label>{label}</Label></Switch.Content></Switch>;
 }
 export function Confirm({ title, description, onConfirm, onClose, busy, error }: { title: string; description: string; onConfirm: () => void; onClose: () => void; busy: boolean; error: string }) {
   return <Modal title={title} onClose={onClose} presentation="dialog"><p className="confirm-copy">{description}</p><ErrorBox message={error} /><div className="modal-actions"><Button variant="secondary" onClick={onClose} disabled={busy}>取消</Button><Button variant="danger" onClick={onConfirm} disabled={busy}>{busy ? '处理中…' : '确认操作'}</Button></div></Modal>;
@@ -77,18 +78,18 @@ export function CopyButton({ value, onCopy }: { value: string; onCopy: (value: s
   return <Button variant="ghost" className="icon-btn" aria-label="复制" onClick={() => onCopy(value)}><Copy size={16} /></Button>;
 }
 export function LogTable({ logs, onSelect }: { logs: Log[]; onSelect?: (log: Log) => void }) {
-  return <div className="table-scroll"><table className="request-table"><thead><tr><th>请求 / 模型</th><th>结果</th><th>上游渠道</th><th>响应耗时</th><th>Token 用量</th><th>请求时间</th>{onSelect && <th><span className="sr-only">详情</span></th>}</tr></thead>
+  return <div className="table-scroll" tabIndex={0} role="region" aria-label="请求列表"><table className="request-table"><thead><tr><th>请求 / 模型</th><th>结果</th><th>上游渠道</th><th>响应耗时</th><th>Token 用量</th><th>请求时间</th>{onSelect && <th><span className="sr-only">详情</span></th>}</tr></thead>
     <tbody>{logs.map(log => <tr key={log.id}>
-      <td><span className="request-identity"><span className="request-icon"><ArrowUpRight size={17} /></span><span><strong className="table-primary mono">{log.model}</strong><span className="table-secondary mono">{log.id.slice(0, 12)}{log.stream ? ' · SSE' : ' · JSON'}</span></span></span></td>
-      <td><Badge tone={log.success ? 'green' : 'red'}>{log.status ?? ''} {log.success ? '成功' : '失败'}</Badge></td><td>{log.channel_name}</td>
-      <td><span className="mono">{log.latency_ms < 1000 ? `${log.latency_ms} ms` : `${(log.latency_ms / 1000).toFixed(2)} s`}</span><span className="latency-track" aria-hidden="true"><i style={{ width: `${Math.min(100, log.latency_ms / 50)}%` }} /></span></td>
+      <td><strong className="table-primary mono" title={log.model}>{log.model}</strong><span className="table-secondary mono" title={log.id}>{log.id.slice(0, 12)}<span className="request-format">{log.stream ? 'SSE' : 'JSON'}</span></span></td>
+      <td><Badge tone={log.success ? 'green' : 'red'}>{log.status ?? ''} {log.success ? '成功' : '失败'}</Badge></td><td><span className="request-channel" title={log.channel_name}>{log.channel_name}</span></td>
+      <td><span className="mono">{log.latency_ms < 1000 ? `${log.latency_ms} ms` : `${(log.latency_ms / 1000).toFixed(2)} s`}</span></td>
       <td className="mono">{log.input_tokens === null || log.output_tokens === null ? '—' : compact(log.input_tokens + log.output_tokens)}</td><td className="muted nowrap">{time(log.created_at)}</td>
       {onSelect && <td><Button variant="ghost" className="icon-btn" aria-label={`查看请求 ${log.id}`} onClick={() => onSelect(log)}><ChevronRight size={18} /></Button></td>}
     </tr>)}</tbody></table></div>;
 }
 export function LogDetail({ log, onClose }: { log: Log; onClose: () => void }) {
   const detail = useApi<Log>(`/logs/${encodeURIComponent(log.id)}`), current = detail.data || log;
-  return <Modal title="Cloudflare 请求详情" onClose={onClose}><ErrorBox message={detail.error} /><div className="log-detail-hero"><Badge tone={current.success ? 'green' : 'red'}>{current.success ? '请求成功' : '请求失败'}</Badge><h3>{current.model}</h3><div><strong>{(current.latency_ms / 1000).toFixed(2)}<small>秒</small></strong><strong>{current.input_tokens === null || current.output_tokens === null ? '—' : compact(current.input_tokens + current.output_tokens)}<small>Tokens</small></strong></div></div><div className="detail-grid">{Object.entries({ 'Cloudflare 日志 ID': current.id, 'EdgeGate 请求 ID': current.request_id || '外部调用', '模型别名': current.model, '上游模型': current.upstream_model || '—', '服务商': current.provider, '渠道': current.channel_name, '密钥': current.key_name, 'HTTP 状态': current.status ?? '未报告', '调用结果': current.success ? '成功' : '失败', '当前尝试序号': current.attempts ?? '—', '耗时': `${current.latency_ms} ms`, '输入 Tokens': current.input_tokens ?? '未报告', '输出 Tokens': current.output_tokens ?? '未报告', 'Cloudflare 费用': money(current.cost_usd), '缓存命中': current.cached ? '是' : '否', '请求时间': time(current.created_at) }).map(([key, value]) => <div key={key}><span>{key}</span><strong className="mono">{value}</strong></div>)}</div><div className="info-note">实时读取 Cloudflare Logs API，D1 不存储此日志。正文是否采集及保留多久，取决于 AI Gateway 的日志设置；可在 Cloudflare 控制台查看完整请求与响应。</div></Modal>;
+  return <Modal title="Cloudflare 请求详情" onClose={onClose}><ErrorBox message={detail.error} /><div className="log-detail-hero"><Badge tone={current.success ? 'green' : 'red'}>{current.success ? '请求成功' : '请求失败'}</Badge><h3>{current.model}</h3><div><strong>{(current.latency_ms / 1000).toFixed(2)}<small>秒</small></strong><strong>{current.input_tokens === null || current.output_tokens === null ? '—' : compact(current.input_tokens + current.output_tokens)}<small>Tokens</small></strong></div></div>{current.upstream_error && <ErrorTrace trace={current.upstream_error} />}<div className="detail-grid">{Object.entries({ 'Cloudflare 日志 ID': current.id, 'EdgeGate 请求 ID': current.request_id || '外部调用', '模型别名': current.model, '上游模型': current.upstream_model || '—', '服务商': current.provider, '渠道': current.channel_name, '密钥': current.key_name, 'HTTP 状态': current.status ?? '未报告', '调用结果': current.success ? '成功' : '失败', '当前尝试序号': current.attempts ?? '—', '耗时': `${current.latency_ms} ms`, '输入 Tokens': current.input_tokens ?? '未报告', '输出 Tokens': current.output_tokens ?? '未报告', 'Cloudflare 费用': money(current.cost_usd), '缓存命中': current.cached ? '是' : '否', '请求时间': time(current.created_at) }).map(([key, value]) => <div key={key}><span>{key}</span><strong className="mono">{value}</strong></div>)}</div><div className="info-note">实时读取 Cloudflare Logs API，D1 不存储此日志。正文是否采集及保留多久，取决于 AI Gateway 的日志设置；可在 Cloudflare 控制台查看完整请求与响应。</div></Modal>;
 }
 export function SuccessIcon() { return <CheckCircle2 size={17} />; }
 export function CheckIcon() { return <Check size={16} />; }

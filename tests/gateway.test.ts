@@ -8,6 +8,7 @@ import { orderCandidates } from '../worker/upstream';
 import { safeBaseUrl } from '../worker/lib/validation';
 import type { Candidate, Channel, Env } from '../worker/types';
 import worker from '../worker/index';
+import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings, type UpstreamErrorTrace } from '../shared/gateway-settings';
 
 const ADMIN = 'test-admin-token-with-at-least-32-characters';
 const ENCRYPTION = btoa('12345678901234567890123456789012');
@@ -94,6 +95,7 @@ async function route(channelId: string, priority = 0, upstreamModel = 'upstream-
   return admin<{ id: string }>('/routes', { model_id: 'test-model', channel_id: channelId, upstream_model: upstreamModel, priority });
 }
 const chat = (token: string, extra = {}) => request('/v1/chat/completions', { key: token, body: { model: 'test-model', messages: [{ role: 'user', content: 'private prompt' }], ...extra } });
+const runtime = (update: Partial<GatewaySettings>) => admin<GatewaySettings>('/config/runtime', { ...DEFAULT_GATEWAY_SETTINGS, ...update }, 'PUT');
 function logFixture(overrides: Partial<RemoteLog> = {}): RemoteLog { return { id: 'cf-remote-log', model: 'cloud-model', provider: 'custom-primary', status_code: 200, success: true, tokens_in: 7, tokens_out: 11, duration: 1234, cost: 0.0001, cached: false, created_at: new Date().toISOString(), metadata: JSON.stringify({ request_id: 'edge-request', model_alias: 'test-model', key_name: 'Test app', attempt: '1', channel_name: 'Primary' }), ...overrides }; }
 
 beforeAll(async () => {
@@ -101,7 +103,7 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
@@ -110,7 +112,7 @@ beforeEach(async () => {
   calls = []; modelCalls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false;
   modelResponse = () => MFResponse.json({ data: [{ id: 'model-a' }, { id: 'model-b' }, { id: 'model-a' }] });
   upstream = () => MFResponse.json(completion);
-  await db.batch(['provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
+  await db.batch(['gateway_settings', 'upstream_error_traces', 'provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
   const response = await request('/api/auth/login', { body: { token: ADMIN } }); expect(response.status).toBe(200);
   cookie = response.headers.get('set-cookie')!.split(';')[0];
   await admin('/models', { id: 'test-model' });
@@ -337,7 +339,7 @@ describe('AI Gateway inference', () => {
   it('does not replay an SSE stream after output starts', async () => {
     await route(await channel('Fallback', 'fallback.example.com'), 1);
     upstream = () => new MFResponse('data: {"error":{"message":"upstream interrupted"}}\n\n', { headers: { 'Content-Type': 'text/event-stream' } });
-    const response = await chat((await key()).key, { stream: true }); expect(await response.text()).toContain('upstream interrupted'); expect(calls).toHaveLength(1);
+    const response = await chat((await key()).key, { stream: true }); const text = await response.text(); expect(text).toContain('upstream_stream_error'); expect(text).not.toContain('upstream interrupted'); expect(calls).toHaveLength(1);
   });
   it('keeps Cloudflare native and dynamic routing integration', async () => {
     await db.prepare('DELETE FROM routes').run(); const cf = await admin<{ id: string }>('/channels', { name: 'CF', kind: 'cloudflare' }); await route(cf.id, 0, 'openai/gpt-4.1');
@@ -697,5 +699,160 @@ describe('editing shared provider profiles from channel forms', () => {
     const b = await admin<{ id: string }>('/channels', { name: 'New link', kind: 'openai', provider_id: a.provider.id, secret: 'new-key', update_profile: true, tags: ['production'], models: ['new-model'] });
     expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(b.id).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
     expect(await db.prepare('SELECT model_id FROM routes WHERE channel_id = ?').bind(a.channelId).all()).toMatchObject({ results: [{ model_id: 'new-model' }] });
+  });
+});
+
+describe('persisted gateway policy and retry limits', () => {
+  it('persists settings and protects them with admin authentication and origin checks', async () => {
+    expect(await admin('/config')).toMatchObject({ runtime: DEFAULT_GATEWAY_SETTINGS });
+    const settings = { ...DEFAULT_GATEWAY_SETTINGS, load_balancing: 'random' as const, same_channel_retries: 5, cross_channel_retries: 10 };
+    expect(await runtime(settings)).toEqual(settings);
+    expect(await admin('/config')).toMatchObject({ runtime: settings });
+    expect((await request('/api/config/runtime', { method: 'PUT', key: (await key()).key, body: DEFAULT_GATEWAY_SETTINGS })).status).toBe(401);
+    expect((await request('/api/config/runtime', { method: 'PUT', admin: true, body: DEFAULT_GATEWAY_SETTINGS, headers: { Origin: 'https://external.example' } })).status).toBe(403);
+    expect(await admin('/config')).toMatchObject({ runtime: settings });
+  });
+  it.each([
+    { same_channel_retries: -1 }, { same_channel_retries: 6 }, { same_channel_retries: 1.5 },
+    { cross_channel_retries: -1 }, { cross_channel_retries: 11 }, { cross_channel_retries: 1.5 },
+    { load_balancing: 'invalid' }, { upstream_error_mode: 'invalid' },
+    { upstream_error_rules: [{ code: '429', message: '' }] },
+    { upstream_error_rules: [{ code: '429', message: 'one' }, { code: '429', message: 'two' }] },
+    { upstream_error_rules: [{ code: '<script>', message: 'bad' }] },
+  ])('rejects invalid runtime settings without overwriting saved settings: %j', async update => {
+    const response = await request('/api/config/runtime', { admin: true, method: 'PUT', body: { ...DEFAULT_GATEWAY_SETTINGS, ...update } });
+    expect(response.status).toBe(400);
+    expect(await admin('/config')).toMatchObject({ runtime: DEFAULT_GATEWAY_SETTINGS });
+  });
+  it('treats zero retries as exactly one request, even with fallback channels', async () => {
+    await runtime({ same_channel_retries: 0, cross_channel_retries: 0 });
+    await route(await channel('Fallback', 'fallback.example.com'), 1);
+    upstream = () => MFResponse.json({ error: { message: 'private failure' } }, { status: 503 });
+    const response = await chat((await key()).key);
+    expect(response.status).toBe(502); expect(response.headers.get('X-Gateway-Attempts')).toBe('1'); expect(calls).toHaveLength(1);
+    expect(await response.text()).not.toContain('private failure');
+  });
+  it('retries the same route before switching, without charging quota again', async () => {
+    await runtime({ same_channel_retries: 2, cross_channel_retries: 0 });
+    upstream = () => calls.length < 3 ? MFResponse.json({ error: 'temporary' }, { status: 503 }) : MFResponse.json(completion);
+    const created = await key({ rpm: 1 }), response = await chat(created.key);
+    expect(response.status).toBe(200); expect(response.headers.get('X-Gateway-Attempts')).toBe('3');
+    expect(new Set(calls.map(call => call.url)).size).toBe(1);
+    expect(calls.map(call => JSON.parse(call.headers['cf-aig-metadata']).channel_attempt)).toEqual(['1', '2', '3']);
+    expect(await db.prepare('SELECT minute_count FROM key_counters WHERE key_id = ?').bind(created.id).first()).toEqual({ minute_count: 1 });
+    expect(await admin<UpstreamErrorTrace[]>(`/traces/${response.headers.get('X-Request-ID')}`)).toHaveLength(2);
+  });
+  it('counts distinct channels and never re-enters one through a duplicate route', async () => {
+    const primary = (await admin<{ id: string }[]>('/channels'))[0];
+    await route(primary.id, 1, 'same-channel-other-model');
+    await route(await channel('Fallback', 'fallback.example.com'), 2);
+    await route(await channel('Third', 'third.example.com'), 3);
+    await runtime({ same_channel_retries: 1, cross_channel_retries: 1 });
+    upstream = () => MFResponse.json({ error: 'temporary' }, { status: 503 });
+    const response = await chat((await key()).key); expect(response.status).toBe(502);
+    const meta = calls.map(call => JSON.parse(call.headers['cf-aig-metadata']));
+    expect(meta.map(m => m.channel_name)).toEqual(['Primary', 'Primary', 'Fallback', 'Fallback']);
+    expect(meta.map(m => m.channel_index)).toEqual(['1', '1', '2', '2']);
+    expect(meta.map(m => m.attempt)).toEqual(['1', '2', '3', '4']);
+  });
+  it('honors five same-channel retries and stops after six attempts', async () => {
+    await runtime({ same_channel_retries: 5, cross_channel_retries: 0 });
+    upstream = () => MFResponse.json({ error: 'temporary' }, { status: 503 });
+    const response = await chat((await key()).key); expect(response.status).toBe(502); expect(calls).toHaveLength(6);
+  });
+  it('supports ten channel switches without the previous five-route cap', async () => {
+    await runtime({ cross_channel_retries: 10 });
+    for (let i = 1; i <= 11; i++) await route(await channel(`Backup${i}`, `backup${i}.example.com`), i);
+    upstream = () => MFResponse.json({ error: 'temporary' }, { status: 503 });
+    const response = await chat((await key()).key); expect(response.status).toBe(502); expect(calls).toHaveLength(11);
+    expect(new Set(calls.map(call => JSON.parse(call.headers['cf-aig-metadata']).channel_id)).size).toBe(11);
+  });
+  it('switches channels immediately on authentication failure, while parameter errors stop', async () => {
+    await runtime({ same_channel_retries: 5, cross_channel_retries: 1 });
+    await route(await channel('Fallback', 'fallback.example.com'), 1);
+    upstream = req => req.url.includes('custom-primary/') ? MFResponse.json({ error: 'bad credentials' }, { status: 401 }) : MFResponse.json(completion);
+    const token = (await key()).key; expect((await chat(token)).status).toBe(200); expect(calls).toHaveLength(2);
+    calls = []; upstream = () => MFResponse.json({ error: 'bad parameter' }, { status: 400 });
+    expect((await chat(token)).status).toBe(400); expect(calls).toHaveLength(1);
+  });
+  it('selects random channels uniformly regardless of duplicate routes, preserving priority', () => {
+    const values = [
+      { id: 'a', channel_id: 'one', priority: 0, weight: 999 },
+      { id: 'a2', channel_id: 'one', priority: 0, weight: 999 },
+      { id: 'b', channel_id: 'two', priority: 0, weight: 1 },
+      { id: 'c', channel_id: 'three', priority: 1, weight: 9999 },
+    ] as Candidate[];
+    expect(orderCandidates(values, () => .6, 'random').map(r => r.channel_id)).toEqual(['two', 'one', 'three']);
+    expect(orderCandidates(values, () => .6, 'weighted').map(r => r.channel_id)).toEqual(['one', 'two', 'three']);
+  });
+});
+
+describe('upstream error disclosure and administrator traces', () => {
+  const original = JSON.stringify({ error: { code: 'quota_exceeded', message: 'private provider detail' } });
+  it.each(['hide', 'show', 'custom'] as const)('applies %s mode to HTTP errors while retaining the original body', async mode => {
+    await runtime({ upstream_error_mode: mode, upstream_error_rules: [{ code: '400', message: 'HTTP fallback' }, { code: 'quota_exceeded', message: 'Custom quota message' }] });
+    upstream = () => new MFResponse(original, { status: 400, headers: { 'content-type': 'application/json', 'x-private-header': 'provider-header-secret' } });
+    const token = (await key()).key, response = await chat(token), text = await response.text();
+    expect(response.status).toBe(400);
+    if (mode === 'show') expect(text).toContain('private provider detail');
+    else { expect(text).not.toContain('private provider detail'); expect(text).not.toContain('quota_exceeded'); }
+    if (mode === 'custom') { expect(text).toContain('Custom quota message'); expect(text).not.toContain('HTTP fallback'); }
+    const requestId = response.headers.get('X-Request-ID')!;
+    const trace = await admin<UpstreamErrorTrace[]>(`/traces/${requestId}`);
+    expect(trace).toHaveLength(1); expect(trace[0]).toMatchObject({ request_id: requestId, attempt: 1, error_body: original, error_code: 'quota_exceeded', status: 400, cf_log_id: 'cf-log-1' });
+    expect(JSON.stringify(trace)).not.toContain('provider-header-secret'); expect(JSON.stringify(trace)).not.toContain('private prompt');
+    expect((await request(`/api/traces/${requestId}`, { key: token })).status).toBe(401);
+    remoteLogs = [logFixture({ id: 'cf-log-1' })];
+    expect(await admin('/logs/cf-log-1')).toMatchObject({ upstream_error: { error_body: original } });
+  });
+  it('matches HTTP status rules and hides unmatched errors without replacing unrelated gateway errors', async () => {
+    await runtime({ upstream_error_mode: 'custom', upstream_error_rules: [{ code: '429', message: 'Custom busy message' }] });
+    const token = (await key()).key;
+    upstream = () => new MFResponse(original, { status: 429 });
+    expect(await (await chat(token)).text()).toContain('Custom busy message');
+    upstream = () => new MFResponse(original, { status: 400 });
+    expect(await (await chat(token)).text()).not.toContain('private provider detail');
+    const unauthorized = await request('/v1/chat/completions', { body: { model: 'test-model', messages: [{ role: 'user', content: 'hello' }] } });
+    expect(unauthorized.status).toBe(401); expect(await unauthorized.text()).toContain('invalid_api_key');
+  });
+  it('uses the requested client protocol for HTTP errors', async () => {
+    await runtime({ upstream_error_mode: 'show' });
+    upstream = () => new MFResponse(original, { status: 400 });
+    const response = await request('/v1/messages', { key: (await key()).key, body: { model: 'test-model', max_tokens: 10, messages: [{ role: 'user', content: 'hello' }] } });
+    expect(await response.json()).toMatchObject({ type: 'error', error: { type: 'invalid_request_error', message: 'private provider detail' } });
+  });
+  it('matches numeric supplier error codes before HTTP status codes', async () => {
+    await runtime({ upstream_error_mode: 'custom', upstream_error_rules: [{ code: '1001', message: 'Custom numeric error' }, { code: '400', message: 'HTTP fallback' }] });
+    upstream = () => MFResponse.json({ errors: [{ code: 1001, message: 'internal detail' }] }, { status: 400 });
+    const response = await chat((await key()).key);
+    expect(await response.text()).toContain('Custom numeric error');
+  });
+  it.each(['hide', 'show', 'custom'] as const)('applies %s mode to same-protocol and converted SSE errors without retrying', async mode => {
+    await runtime({ same_channel_retries: 2, cross_channel_retries: 2, upstream_error_mode: mode, upstream_error_rules: [{ code: 'quota_exceeded', message: 'Custom stream message' }] });
+    await route(await channel('Fallback', 'fallback.example.com'), 1);
+    upstream = () => new MFResponse(`data: ${original}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+    const token = (await key()).key;
+    for (const upstreamProtocol of ['openai', 'anthropic']) {
+      await db.prepare('UPDATE provider_profiles SET protocol = ?').bind(upstreamProtocol).run();
+      const raw = upstreamProtocol === 'anthropic' ? JSON.stringify({ type: 'error', ...JSON.parse(original) }) : original;
+      upstream = () => new MFResponse(`data: ${raw}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+      for (const protocol of ['openai', 'anthropic']) {
+      const response = protocol === 'openai' ? await chat(token, { stream: true, max_tokens: 10 }) : await request('/v1/messages', { key: token, body: { model: 'test-model', max_tokens: 10, messages: [{ role: 'user', content: 'hello' }], stream: true } });
+      const text = await response.text();
+      expect(text).toContain(mode === 'show' ? 'private provider detail' : mode === 'custom' ? 'Custom stream message' : '上游服务暂时无法完成请求');
+      if (mode !== 'show') expect(text).not.toContain('private provider detail');
+      const traces = await admin<UpstreamErrorTrace[]>(`/traces/${response.headers.get('X-Request-ID')}`);
+      expect(traces).toHaveLength(1); expect(traces[0].error_body).toBe(raw);
+      }
+    }
+    expect(calls).toHaveLength(4);
+  });
+  it('caps retained errors, marks truncation and excludes expired traces', async () => {
+    upstream = () => new MFResponse('x'.repeat(20000), { status: 400 });
+    const response = await chat((await key()).key), id = response.headers.get('X-Request-ID')!;
+    const traces = await admin<UpstreamErrorTrace[]>(`/traces/${id}`);
+    expect(traces[0].error_body.length).toBe(16384); expect(traces[0].truncated).toBe(1);
+    await db.prepare("UPDATE upstream_error_traces SET created_at = '2000-01-01T00:00:00.000Z'").run();
+    expect(await admin(`/traces/${id}`)).toEqual([]);
   });
 });

@@ -18,12 +18,14 @@ export interface ApiKey {
   expires_at: string | null; revoked_at: string | null; created_at: string; requests_today: number;
 }
 export interface Log {
+  upstream_error?: UpstreamErrorTrace | null;
   id: string; request_id: string | null; model: string; channel_name: string; key_name: string; status: number | null; success: boolean; latency_ms: number;
   input_tokens: number | null; output_tokens: number | null; cost_usd: number | null;
   cached: number; stream: number; attempts: number | null; error_code: string | null; created_at: string; upstream_model: string | null; provider: string;
 }
 export interface LogPage { data: Log[]; total: number | null; page: number; page_size: number; has_more: boolean; source: 'cloudflare' }
 export interface Config {
+  runtime: GatewaySettings;
   account_id: string; gateway_id: string; ai_token_configured: boolean; aig_token_configured: boolean;
   encryption_configured: boolean; control_token_configured: boolean; observability_source: 'cloudflare'; dashboard_url: string;
 }
@@ -34,3 +36,4 @@ export interface Stats {
   models: { model: string; requests: number }[]; range: '24h' | '7d';
   source: 'cloudflare'; scope: 'gateway'; gateway_id: string;
 }
+import type { GatewaySettings, UpstreamErrorTrace } from '../shared/gateway-settings';
