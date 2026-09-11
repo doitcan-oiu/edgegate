@@ -1,3 +1,4 @@
+import type { SyncJobStatus } from '../shared/observability';
 export interface Channel {
   protocol: 'openai' | 'anthropic'; tags: string[]; models: string[];
   id: string; name: string; kind: 'cloudflare' | 'ai-gateway' | 'openai'; base_url: string;
@@ -18,12 +19,12 @@ export interface ApiKey {
   expires_at: string | null; revoked_at: string | null; created_at: string; requests_today: number;
 }
 export interface Log {
-  upstream_error?: UpstreamErrorTrace | null;
+  upstream_error?: UpstreamErrorTrace | null; synced_at?: string;
   id: string; request_id: string | null; model: string; channel_name: string; key_name: string; status: number | null; success: boolean; latency_ms: number;
   input_tokens: number | null; output_tokens: number | null; cost_usd: number | null;
   cached: number; stream: number; attempts: number | null; error_code: string | null; created_at: string; upstream_model: string | null; provider: string;
 }
-export interface LogPage { data: Log[]; total: number | null; page: number; page_size: number; has_more: boolean; source: 'cloudflare' }
+export interface LogPage { data: Log[]; total: number | null; page: number; page_size: number; has_more: boolean; source: 'cloudflare'; storage: 'd1'; retention_days: number; sync: SyncJobStatus }
 export interface Config {
   runtime: GatewaySettings;
   account_id: string; gateway_id: string; ai_token_configured: boolean; aig_token_configured: boolean;
@@ -31,9 +32,10 @@ export interface Config {
 }
 export interface Stats {
   summary: { requests: number; successes: number | null; input_tokens: number | null; output_tokens: number | null;
-    cost_usd: number | null; cache_hits: number | null };
+    cost_usd: number | null; cache_hits: number | null } | null;
   series: { time: string; requests: number; errors: number | null }[];
   models: { model: string; requests: number }[]; range: '24h' | '7d';
-  source: 'cloudflare'; scope: 'gateway'; gateway_id: string;
+  source: 'cloudflare'; scope: 'gateway'; gateway_id: string; storage: 'd1';
+  window_start: string | null; window_end: string | null; synced_at: string | null; sync: SyncJobStatus;
 }
 import type { GatewaySettings, UpstreamErrorTrace } from '../shared/gateway-settings';

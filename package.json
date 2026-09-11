@@ -23,7 +23,7 @@
   "cloudflare": {
     "bindings": {
       "DB": {
-        "description": "D1 数据库，保存渠道、模型、应用 API Key 和配额；部署脚本会自动应用 migrations。"
+        "description": "D1 数据库，保存渠道、模型、应用 API Key、配额及日志 / 统计缓存；部署脚本会自动应用 migrations。"
       },
       "KV": {
         "description": "KV 命名空间，保存管理员会话和 Cloudflare 分析 Schema 缓存。"

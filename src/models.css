@@ -1,12 +1,19 @@
 .models-page { display: flex; flex-direction: column; gap: 18px; min-width: 0; }
 .models-page-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
-.models-page-title { display: flex; align-items: center; gap: 10px; }
+.models-page-title { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 10px; }
 .models-page-title h1 { font-size: 24px; font-weight: 500; line-height: 1.4; letter-spacing: -.02em; }
 .models-count { min-width: 24px; padding: 1px 6px; border-radius: 4px; background: var(--brand-pale-green); color: var(--brand-green); font-size: 13px; text-align: center; font-variant-numeric: tabular-nums; }
+.models-scope-summary { padding-left: 10px; border-left: 1px solid var(--border); color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .models-page-heading p { margin-top: 6px; color: var(--muted); font-size: 13px; }
 .models-page .btn { min-height: 32px; font-size: 13px; font-weight: 400; }
 .models-page-heading > .btn { min-height: 34px; font-size: 14px; }
-.model-workspace { display: grid; grid-template-columns: 252px minmax(0,1fr); height: clamp(360px,calc(100dvh - 272px),900px); border-radius: 6px; }
+.model-scope-bar { padding: 10px 12px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-inset); }
+.model-scope-options { display: flex; flex: 1; flex-wrap: wrap; gap: 6px; min-width: min(100%,220px); max-height: 112px; padding: 2px; margin: -2px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+.models-page .btn.model-scope-tag { min-height: 30px; height: auto; max-width: 100%; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--muted); font-size: 13px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
+.models-page .btn.model-scope-tag:hover { border-color: #99b5aa; background: #f1f7f3; color: var(--brand-green); }
+.models-page .btn.model-scope-tag[aria-pressed="true"] { border-color: var(--brand-green); background: var(--brand-green); color: #fff; }
+.models-page .btn.model-scope-tag:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
+.model-workspace { display: grid; grid-template-columns: 252px minmax(0,1fr); height: clamp(360px,calc(100dvh - 330px),900px); border-radius: 6px; }
 .model-directory { display: flex; flex-direction: column; min-width: 0; min-height: 0; border-right: 1px solid var(--border); background: var(--surface-inset); }
 .directory-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 14px 10px; }
 .directory-heading h2 { font-size: 14px; font-weight: 500; letter-spacing: 0; }
@@ -34,9 +41,6 @@
 .routing-model-title h2 { font: 500 17px/1.5 var(--font-mono); letter-spacing: -.02em; overflow-wrap: anywhere; min-width: 0; }
 .routing-model-title .badge { padding: 1px 6px; font-size: 12px; font-weight: 400; }
 .routing-heading p { margin-top: 4px; color: var(--muted); font-size: 13px; line-height: 1.5; overflow-wrap: anywhere; }
-.routing-model-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
-.models-page .routing-model-actions .btn { min-height: 28px; padding: 4px 7px; }
-.models-page .routing-model-actions .icon-btn { width: 28px; }
 .routing-toolbar { display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; gap: 12px; padding: 12px 0 10px; }
 .routing-toolbar > div { display: flex; align-items: baseline; gap: 8px; }
 .routing-toolbar h3 { font-size: 14px; font-weight: 500; }
@@ -72,8 +76,8 @@
 .models-page .route-row-actions .icon-btn { width: 28px; }
 .models-page .route-edit { color: var(--link); }
 .models-page .route-edit:hover { color: var(--link); background: var(--brand-pale-blue); }
-.models-page .route-delete, .models-page .model-delete { color: var(--subtle); }
-.models-page .route-delete:hover, .models-page .model-delete:hover { color: var(--danger); background: var(--danger-soft); }
+.models-page .route-delete { color: var(--subtle); }
+.models-page .route-delete:hover { color: var(--danger); background: var(--danger-soft); }
 .routing-explainer { display: flex; align-items: flex-start; flex-shrink: 0; gap: 6px; padding: 10px 0 12px; color: var(--muted); }
 .routing-explainer > svg { flex-shrink: 0; margin-top: 2px; color: var(--brand-green); }
 .routing-explainer p { font-size: 12px; line-height: 1.6; }
@@ -96,6 +100,5 @@
   .directory-foot { display: none; }
   .routing-workspace { padding-inline: 12px; }
   .routing-heading { flex-wrap: wrap; gap: 6px; padding-top: 12px; }
-  .routing-model-actions { margin-left: auto; }
   .route-table-scroll { max-height: 56dvh; }
 }

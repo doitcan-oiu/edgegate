@@ -6,7 +6,7 @@ import { Miniflare, convertV4MiniflareOptions, Response as MFResponse, type Requ
 import { decryptSecret, encryptSecret } from '../worker/lib/crypto';
 import { orderCandidates } from '../worker/upstream';
 import { safeBaseUrl } from '../worker/lib/validation';
-import type { Candidate, Channel, Env } from '../worker/types';
+import type { Candidate, Channel, Env, Model, Route } from '../worker/types';
 import worker from '../worker/index';
 import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings, type UpstreamErrorTrace } from '../shared/gateway-settings';
 
@@ -21,7 +21,7 @@ let mf: Miniflare, db: Awaited<ReturnType<Miniflare['getD1Database']>>, cookie =
 let upstream: (request: MFRequest) => Promise<MFResponse> | MFResponse;
 let calls: Recorded[], modelCalls: Recorded[], controlCalls: Recorded[], providers: Map<string, Provider>, remoteLogs: RemoteLog[];
 let modelResponse: (request: MFRequest) => Promise<MFResponse> | MFResponse;
-let controlFailure = 0, graphqlFailure = false;
+let controlFailure = 0, graphqlFailure = false, logFailurePage = 0;
 const ok = (result: unknown, info?: unknown) => MFResponse.json({ success: true, result, ...(info ? { result_info: info } : {}) });
 const fail = (status: number) => MFResponse.json({ success: false, errors: [{ message: 'sensitive Cloudflare response' }] }, { status });
 
@@ -57,10 +57,13 @@ async function outbound(req: MFRequest): Promise<MFResponse> {
       return ok(provider);
     }
     if (url.pathname === `${root}/gateways/test-gateway/logs`) {
-      let rows = remoteLogs;
+      const page = Number(url.searchParams.get('page') || 1), per = Number(url.searchParams.get('per_page') || 25);
+      if (logFailurePage === page) return fail(503);
+      let rows = remoteLogs.filter(log => (!url.searchParams.get('start_date') || Date.parse(log.created_at) >= Date.parse(url.searchParams.get('start_date')!)) && (!url.searchParams.get('end_date') || Date.parse(log.created_at) <= Date.parse(url.searchParams.get('end_date')!)));
+      rows = [...rows].sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id));
+      if (url.searchParams.get('order_by_direction') === 'desc') rows.reverse();
       if (url.searchParams.has('success')) rows = rows.filter(l => l.success === (url.searchParams.get('success') === 'true'));
       if (url.searchParams.get('model')) rows = rows.filter(l => l.model === url.searchParams.get('model'));
-      const page = Number(url.searchParams.get('page') || 1), per = Number(url.searchParams.get('per_page') || 25);
       return ok(rows.slice((page - 1) * per, page * per), { total_count: rows.length, total_pages: Math.ceil(rows.length / per) });
     }
     if (url.pathname.startsWith(`${root}/gateways/test-gateway/logs/`)) return remoteLogs.find(l => l.id === url.pathname.split('/').at(-1)) ? ok(remoteLogs.find(l => l.id === url.pathname.split('/').at(-1))) : fail(404);
@@ -103,16 +106,17 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
 });
 beforeEach(async () => {
-  calls = []; modelCalls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false;
+  await db.prepare('UPDATE observability_settings SET log_retention_days = 7 WHERE id = 1').run();
+  calls = []; modelCalls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false; logFailurePage = 0;
   modelResponse = () => MFResponse.json({ data: [{ id: 'model-a' }, { id: 'model-b' }, { id: 'model-a' }] });
   upstream = () => MFResponse.json(completion);
-  await db.batch(['gateway_settings', 'upstream_error_traces', 'provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
+  await db.batch(['observability_jobs', 'observability_snapshots', 'observability_logs', 'gateway_settings', 'upstream_error_traces', 'provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
   const response = await request('/api/auth/login', { body: { token: ADMIN } }); expect(response.status).toBe(200);
   cookie = response.headers.get('set-cookie')!.split(';')[0];
   await admin('/models', { id: 'test-model' });
@@ -351,37 +355,129 @@ describe('AI Gateway inference', () => {
   });
 });
 
-describe('Cloudflare logs and analytics as the source of truth', () => {
-  it('reads paginated logs from Cloudflare and preserves metadata correlation', async () => {
-    remoteLogs = Array.from({ length: 26 }, (_, i) => logFixture({ id: `remote-${i}` }));
+async function runSync(force = false) {
+  if (force) await admin('/observability/sync', {}, 'POST');
+  const result = await (await mf.getWorker()).scheduled({ cron: '* * * * *', scheduledTime: new Date() });
+  expect(result.outcome).toBe('ok');
+}
+
+describe('Cloudflare observability synchronized to D1', () => {
+  it('reads paginated cached logs without contacting Cloudflare, preserving metadata correlation', async () => {
+    remoteLogs = Array.from({ length: 26 }, (_, i) => logFixture({ id: `remote-${i}`, created_at: new Date(Date.now() - i * 1000).toISOString() }));
+    await runSync(); controlCalls = [];
     const result = await admin<{ data: Record<string, unknown>[]; total: number; has_more: boolean }>('/logs?page=2');
     expect(result.total).toBe(26); expect(result.has_more).toBe(false); expect(result.data).toHaveLength(1); expect(result.data[0]).toMatchObject({ id: 'remote-25', request_id: 'edge-request', model: 'test-model', upstream_model: 'cloud-model', status: 200, key_name: 'Test app', source: 'cloudflare' });
+    expect(controlCalls).toEqual([]);
   });
-  it('uses upstream model and success filters on the Cloudflare API', async () => {
+  it('filters by upstream model and success locally even when CF is unavailable', async () => {
     remoteLogs = [logFixture(), logFixture({ id: 'failed', model: 'other-model', success: false, status_code: 500 })];
-    expect(await admin('/logs?status=error&model=other-model')).toMatchObject({ total: 1, data: [{ id: 'failed' }] });
-    expect(controlCalls.at(-1)?.url).toContain('success=false'); expect(controlCalls.at(-1)?.url).toContain('model=other-model');
+    await runSync(); controlCalls = []; controlFailure = 503;
+    expect(await admin('/logs?status=error&model=other-model')).toMatchObject({ total: 1, storage: 'd1', data: [{ id: 'failed' }] });
+    expect(controlCalls).toEqual([]);
   });
-  it('retrieves log detail without returning secret-bearing request headers', async () => {
+  it('serves log details from D1 without storing secret-bearing headers or request bodies', async () => {
     remoteLogs = [logFixture({ request_head: 'Authorization: secret' })];
-    const detail = await admin(`/logs/${remoteLogs[0].id}`); expect(detail).toMatchObject({ id: remoteLogs[0].id, source: 'cloudflare' }); expect(detail).not.toHaveProperty('request_head'); expect(JSON.stringify(detail)).not.toContain('Authorization');
+    await runSync(); controlCalls = []; controlFailure = 503;
+    const detail = await admin(`/logs/${remoteLogs[0].id}`); expect(detail).toMatchObject({ id: remoteLogs[0].id, source: 'cloudflare', storage: 'd1' }); expect(detail).not.toHaveProperty('request_head'); expect(JSON.stringify(detail)).not.toContain('Authorization');
+    expect(controlCalls).toEqual([]);
+    expect(JSON.stringify((await db.prepare('SELECT payload FROM observability_logs').all()).results)).not.toContain('Authorization');
   });
   it('does not fabricate missing status, tokens, or costs', async () => {
     remoteLogs = [logFixture({ status_code: undefined, tokens_in: null, tokens_out: null, cost: undefined, metadata: '{invalid' })];
+    await runSync();
     const result = await admin<{ data: Record<string, unknown>[] }>('/logs'); expect(result.data[0]).toMatchObject({ status: null, input_tokens: null, output_tokens: null, cost_usd: null, key_name: '外部调用', model: 'cloud-model' });
   });
-  it('uses GraphQL aggregates independently of retained log pages or local storage', async () => {
-    remoteLogs = [logFixture()];
-    const result = await admin('/stats?range=24h'); expect(result).toMatchObject({ source: 'cloudflare', scope: 'gateway', summary: { requests: 12345, successes: 12300, input_tokens: 500000, output_tokens: 100000, cost_usd: 4.25, cache_hits: 1000 } });
-    const query = String(controlCalls.at(-1)?.body.query); expect(query).toContain('aiGatewayRequestsAdaptiveGroups'); expect(query).toContain('gateway: "test-gateway"'); expect(query).toContain(`accountTag: "${account}"`);
-    expect(await db.prepare('SELECT COUNT(*) AS n FROM request_logs').first()).toMatchObject({ n: 0 });
+  it('keeps GraphQL aggregates independent of local log totals and fixes the snapshot time window', async () => {
+    remoteLogs = [logFixture()]; await runSync();
+    const result = await admin('/stats?range=24h'); expect(result).toMatchObject({ source: 'cloudflare', storage: 'd1', scope: 'gateway', summary: { requests: 12345, successes: 12300, input_tokens: 500000, output_tokens: 100000, cost_usd: 4.25, cache_hits: 1000 } });
+    expect(result.window_end).toBeTruthy(); expect(result.window_start).toBeTruthy();
+    const query = String(controlCalls.find(call => String(call.body.query).includes('aiGatewayRequestsAdaptiveGroups'))?.body.query); expect(query).toContain('gateway: "test-gateway"'); expect(query).toContain(`accountTag: "${account}"`);
+    controlCalls = []; expect(await admin('/stats?range=24h')).toEqual(result); expect(controlCalls).toEqual([]);
   });
-  it('reports Cloudflare failures rather than showing fabricated zero totals', async () => {
-    graphqlFailure = true; const stats = await request('/api/stats', { admin: true }); expect(stats.status).toBe(502); expect(await stats.text()).toContain('cloudflare_analytics_error');
-    controlFailure = 403; expect((await request('/api/logs', { admin: true })).status).toBe(502);
+  it('distinguishes first-sync failure from zero and retains successful snapshots after failures', async () => {
+    controlCalls = [];
+    expect(await admin('/stats')).toMatchObject({ summary: null, synced_at: null, sync: { state: 'waiting' } });
+    expect(controlCalls).toHaveLength(0);
+    graphqlFailure = true; await runSync();
+    expect(await admin('/stats')).toMatchObject({ summary: null, sync: { state: 'error' } });
+    graphqlFailure = false; remoteLogs = [logFixture()]; await runSync(true);
+    const saved = await admin('/stats');
+    controlFailure = 503; await runSync(true);
+    expect(await admin('/stats')).toMatchObject({ summary: saved.summary, synced_at: saved.synced_at, window_end: saved.window_end, sync: { state: 'error', last_success_at: saved.synced_at } });
+    expect(await admin('/logs')).toMatchObject({ total: 1, sync: { state: 'error' } });
   });
-  it('does not modify legacy D1 logs when querying Cloudflare or calling models', async () => {
+  it('persists and coalesces manual requests without performing work in the HTTP request', async () => {
+    controlCalls = [];
+    expect((await request('/api/observability/sync', { method: 'POST' })).status).toBe(401);
+    await Promise.all([admin('/observability/sync', {}, 'POST'), admin('/observability/sync', {}, 'POST')]);
+    expect(controlCalls).toEqual([]);
+    expect((await db.prepare('SELECT requested_seq, handled_seq FROM observability_jobs').all()).results.every(row => row.requested_seq === 1 && row.handled_seq === 0)).toBe(true);
+    await Promise.all([runSync(), runSync()]);
+    expect(controlCalls.filter(call => String(call.body.query).includes('aiGatewayRequestsAdaptiveGroups'))).toHaveLength(2);
+    controlCalls = []; await runSync(); expect(controlCalls).toHaveLength(0);
+  });
+  it('checkpoints bounded log pages, resumes the failed page, and does not skip same-timestamp rows', async () => {
+    const stamp = new Date(Date.now() - 60000).toISOString();
+    remoteLogs = Array.from({ length: 260 }, (_, i) => logFixture({ id: `many-${String(i).padStart(4, '0')}`, created_at: stamp }));
+    await runSync(); expect(await admin('/logs')).toMatchObject({ total: 200 });
+    const before = await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:head'").first<{ cursor: string }>();
+    expect(JSON.parse(before!.cursor).window.page).toBe(5);
+    logFailurePage = 5; await runSync(true);
+    expect(await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:head'").first()).toEqual(before);
+    expect(await admin('/logs')).toMatchObject({ total: 200 });
+    logFailurePage = 0; await runSync(true);
+    expect(await admin('/logs')).toMatchObject({ total: 260 });
+    await runSync(true); expect(await admin('/logs')).toMatchObject({ total: 260 });
+  });
+  it('revisits older SSE records and keeps different upstream attempts of the same request', async () => {
+    remoteLogs = [logFixture({ id: 'attempt-1', created_at: new Date(Date.now() - 90 * 60000).toISOString(), tokens_out: null }), logFixture({ id: 'attempt-2' })];
+    await runSync(); expect(await admin('/logs')).toMatchObject({ total: 2 });
+    remoteLogs[0].tokens_out = 1234; remoteLogs[0].duration = 3600000;
+    await runSync(true);
+    expect(await admin('/logs/attempt-1')).toMatchObject({ output_tokens: 1234, latency_ms: 3600000 });
+    expect(await admin('/logs')).toMatchObject({ total: 2 });
+  });
+  it('backfills outage gaps and expanded retention, and immediately hides expired rows', async () => {
+    await runSync();
+    const cursor = { covered_from: new Date(Date.now() - 7 * 86400000).toISOString(), covered_to: new Date(Date.now() - 4 * 3600000).toISOString(), last_audit_at: Date.now() };
+    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify(cursor)).run();
+    remoteLogs = [logFixture({ id: 'outage', created_at: new Date(Date.now() - 3 * 3600000).toISOString() })];
+    await runSync(true); expect(await admin('/logs/outage')).toMatchObject({ id: 'outage' });
+    remoteLogs.push(logFixture({ id: 'older', created_at: new Date(Date.now() - 7.5 * 86400000).toISOString() }));
+    await admin('/config/observability', { log_retention_days: 30 }, 'PUT');
+    for (let i = 0; i < 8; i++) await runSync(true);
+    expect(await admin('/logs/older')).toMatchObject({ id: 'older' });
+    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify({ covered_from: new Date(Date.now() - 30 * 86400000).toISOString(), covered_to: new Date().toISOString() })).run();
+    await admin('/config/observability', { log_retention_days: 7 }, 'PUT');
+    expect((await request('/api/logs/older', { admin: true })).status).toBe(404);
+    expect(await admin('/logs')).toMatchObject({ total: 1 });
+    await runSync(); expect(await db.prepare("SELECT id FROM observability_logs WHERE id = 'older'").first()).toBeNull();
+    await admin('/config/observability', { log_retention_days: 30 }, 'PUT');
+    expect(await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:history'").first()).toEqual({ cursor: null });
+    for (let i = 0; i < 8; i++) await runSync(true);
+    expect(await admin('/logs/older')).toMatchObject({ id: 'older' });
+    expect((await request('/api/config/observability', { admin: true, method: 'PUT', body: { log_retention_days: 100 } })).status).toBe(400);
+  });
+  it('does not overwrite newer observed SSE usage with an older in-flight observation', async () => {
+    remoteLogs = [logFixture()]; await runSync();
+    const cached = await admin('/logs/cf-remote-log');
+    // A later request has already committed while the next tested observation is older.
+    await db.prepare('UPDATE observability_logs SET observed_at = ?, payload = ? WHERE id = ?').bind(Date.now() + 60000, JSON.stringify({ ...cached, output_tokens: 9999 }), 'cf-remote-log').run();
+    remoteLogs[0].tokens_out = 1;
+    await runSync(true);
+    expect(await admin('/logs/cf-remote-log')).toMatchObject({ output_tokens: 9999 });
+  });
+  it('fetches the newest records first when head synchronization exceeds its page budget', async () => {
+    const now = Date.now();
+    remoteLogs = Array.from({ length: 240 }, (_, i) => logFixture({ id: `newest-${i}`, created_at: new Date(now - i * 1000).toISOString() }));
+    await runSync();
+    const result = await admin<{ total: number; data: { id: string }[] }>('/logs');
+    expect(result.total).toBe(200); expect(result.data[0].id).toBe('newest-0');
+    expect((await request('/api/logs/newest-239', { admin: true })).status).toBe(404);
+  });
+  it('isolates account/gateway caches and does not read or modify legacy logs', async () => {
     await db.prepare("INSERT INTO request_logs (id,key_id,model,status,latency_ms) VALUES ('legacy','old','old-model',200,3)").run();
+    await db.prepare('INSERT INTO observability_logs (scope, id, created_at, success, upstream_model, payload, synced_at) VALUES (?, ?, ?, 1, ?, ?, ?)').bind('another-gateway', 'external', new Date().toISOString(), 'secret-model', '{}', new Date().toISOString()).run();
     expect(await admin('/logs')).toMatchObject({ total: 0 }); await chat((await key()).key);
     expect(await db.prepare('SELECT COUNT(*) AS n FROM request_logs').first()).toMatchObject({ n: 1 });
   });
@@ -407,6 +503,65 @@ async function visibleModels(token: string) {
 }
 const anthropicCompletion = { id: 'msg_test', type: 'message', role: 'assistant', model: 'claude-sonnet-4-5', content: [{ type: 'text', text: '你好，世界' }], stop_reason: 'end_turn', stop_sequence: null, usage: { input_tokens: 7, output_tokens: 11 } };
 const messages = (token: string, extra = {}, headers = {}) => request('/v1/messages', { headers: { 'x-api-key': token, 'anthropic-version': '2023-06-01', ...headers }, body: { model: 'test-model', messages: [{ role: 'user', content: '你好' }], max_tokens: 100, ...extra } });
+
+describe('tag-scoped model and route administration', () => {
+  async function sharedChannels() {
+    const a = await catalog('ScopedA', 'openai', ['AA'], ['claude-opus-5']);
+    const b = await catalog('ScopedB', 'openai', ['BB'], ['claude-opus-5']);
+    const models = await admin<(Model & { routes: Route[] })[]>('/models');
+    const model = models.find(model => model.id === 'claude-opus-5')!;
+    return { a, b, model, routeA: model.routes.find(route => route.channel_id === a.channelId)!, routeB: model.routes.find(route => route.channel_id === b.channelId)! };
+  }
+  it('scopes both the model directory and routes, retaining disabled channels and routes', async () => {
+    const { a, routeA, routeB } = await sharedChannels();
+    await db.prepare('UPDATE channels SET enabled = 0 WHERE id = ?').bind(a.channelId).run();
+    await db.prepare('UPDATE routes SET enabled = 0 WHERE id = ?').bind(routeA.id).run();
+    expect(await admin('/models?tag=AA')).toMatchObject([{ id: 'claude-opus-5', routes: [{ id: routeA.id, enabled: 0 }] }]);
+    expect((await admin<(Model & { routes: Route[] })[]>('/models?tag=AA'))[0].routes).toHaveLength(1);
+    expect(await admin('/models?tag=BB')).toMatchObject([{ id: 'claude-opus-5', routes: [{ id: routeB.id }] }]);
+    expect(await admin('/models?tag=aa')).toEqual([]);
+    expect(await admin('/models?tag=deleted')).toEqual([]);
+    expect((await admin<Model[]>('/models?untagged=1')).map(model => model.id)).toEqual(['test-model']);
+  });
+  it('reuses a global model when adding a scoped route and leaves other tags unchanged', async () => {
+    const { a, model, routeB } = await sharedChannels();
+    await admin(`/models/${model.id}`, { description: 'shared description', enabled: false }, 'PUT');
+    await admin('/routes?tag=AA', { model_id: model.id, channel_id: a.channelId, upstream_model: 'opus-alias', weight: 3 });
+    expect(await admin('/models?tag=BB')).toMatchObject([{ id: model.id, description: 'shared description', enabled: 0, routes: [routeB] }]);
+    expect((await admin<(Model & { routes: Route[] })[]>('/models?tag=AA'))[0].routes).toHaveLength(2);
+  });
+  it('rejects source and destination routes outside the selected tag, including stale tags', async () => {
+    const { a, b, model, routeA, routeB } = await sharedChannels();
+    const data = { model_id: model.id, channel_id: a.channelId, upstream_model: 'changed' };
+    expect((await request('/api/routes?tag=AA', { admin: true, body: { ...data, channel_id: b.channelId } })).status).toBe(400);
+    expect((await request(`/api/routes/${routeB.id}?tag=AA`, { admin: true, method: 'PUT', body: data })).status).toBe(409);
+    expect((await request(`/api/routes/${routeA.id}?tag=AA`, { admin: true, method: 'PUT', body: { ...data, channel_id: b.channelId } })).status).toBe(400);
+    expect((await request(`/api/routes/${routeB.id}?tag=AA`, { admin: true, method: 'DELETE' })).status).toBe(409);
+    await editProvider(a.provider, { tags: ['CC'] });
+    expect((await request(`/api/routes/${routeA.id}?tag=AA`, { admin: true, method: 'PUT', body: data })).status).toBe(409);
+    expect((await request(`/api/routes/${routeA.id}?tag=AA`, { admin: true, method: 'DELETE' })).status).toBe(409);
+    expect(await db.prepare('SELECT * FROM routes WHERE id = ?').bind(routeB.id).first()).toMatchObject(routeB);
+  });
+  it('keeps global deletion and disabling outside tag scope and preserves BB inference after AA route removal', async () => {
+    const { model, routeA, routeB } = await sharedChannels();
+    expect((await request(`/api/models/${model.id}?tag=AA`, { admin: true, method: 'PUT', body: { enabled: false } })).status).toBe(400);
+    expect((await request(`/api/models/${model.id}?tag=AA`, { admin: true, method: 'DELETE' })).status).toBe(400);
+    await admin(`/routes/${routeA.id}?tag=AA`, undefined, 'DELETE');
+    expect(await admin('/models?tag=AA')).toEqual([]);
+    expect(await admin('/models?tag=BB')).toMatchObject([{ id: model.id, enabled: 1, routes: [routeB] }]);
+    const token = (await key({ allowed_tags: ['BB'] })).key;
+    expect((await chat(token, { model: model.id })).status).toBe(200);
+    expect(calls).toHaveLength(1); expect(calls[0].url).toContain('/custom-scopedb/');
+  });
+  it('shows a multi-tag channel in both scopes without duplicating or forking its route', async () => {
+    const a = await catalog('SharedTags', 'openai', ['AA', 'BB'], ['claude-opus-5']);
+    const aa = await admin<(Model & { routes: Route[] })[]>('/models?tag=AA');
+    const route = aa[0].routes[0];
+    await admin(`/routes/${route.id}?tag=AA`, { model_id: 'claude-opus-5', channel_id: a.channelId, upstream_model: route.upstream_model, weight: 7, enabled: false }, 'PUT');
+    const bb = await admin<(Model & { routes: Route[] })[]>('/models?tag=BB');
+    expect(bb[0].routes).toHaveLength(1); expect(bb[0].routes[0]).toMatchObject({ id: route.id, weight: 7, enabled: 0 });
+  });
+});
 
 describe('provider tags and the union of accessible models', () => {
   it('unions Sonnet from A and Opus from B for one tagged API key', async () => {
@@ -865,7 +1020,7 @@ describe('upstream error disclosure and administrator traces', () => {
     expect(trace).toHaveLength(1); expect(trace[0]).toMatchObject({ request_id: requestId, attempt: 1, error_body: original, error_code: 'quota_exceeded', status: 400, cf_log_id: 'cf-log-1' });
     expect(JSON.stringify(trace)).not.toContain('provider-header-secret'); expect(JSON.stringify(trace)).not.toContain('private prompt');
     expect((await request(`/api/traces/${requestId}`, { key: token })).status).toBe(401);
-    remoteLogs = [logFixture({ id: 'cf-log-1' })];
+    remoteLogs = [logFixture({ id: 'cf-log-1' })]; await runSync();
     expect(await admin('/logs/cf-log-1')).toMatchObject({ upstream_error: { error_body: original } });
   });
   it('matches HTTP status rules and hides unmatched errors without replacing unrelated gateway errors', async () => {

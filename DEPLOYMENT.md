@@ -1,6 +1,6 @@
 # EdgeGate 部署到 Cloudflare Workers
 
-本指南适用于本仓库的 React + HeroUI 管理界面和 Worker API。二者部署为**一个 Cloudflare Worker**，前端由 Workers Static Assets 提供，业务配置保存在 D1，管理员会话保存在 KV。自定义服务商的推理经过 Cloudflare AI Gateway，日志与分析也从 Cloudflare 读取。
+本指南适用于本仓库的 React + HeroUI 管理界面和 Worker API。二者部署为**一个 Cloudflare Worker**，前端由 Workers Static Assets 提供，业务配置保存在 D1，管理员会话保存在 KV。自定义服务商的推理经过 Cloudflare AI Gateway，日志与分析由 Cron 从 Cloudflare 同步到 D1，网页读取缓存。
 
 ## 1. 选择部署方式
 
@@ -23,7 +23,7 @@
 | 资源 | 本项目配置名 | 用途 |
 | --- | --- | --- |
 | Worker | `name`，默认 `edgegate` | 管理界面和 `/api/*`、`/v1/*` API |
-| D1 数据库 | 绑定名 `DB` | 渠道、加密供应商密钥、模型、应用密钥哈希、标签及配额 |
+| D1 数据库 | 绑定名 `DB` | 渠道、加密供应商密钥、模型、应用密钥哈希、标签、配额及日志 / 统计缓存 |
 | KV 命名空间 | 绑定名 `KV` | 管理员会话、分析 Schema 缓存 |
 | AI Gateway | `vars.AI_GATEWAY_ID` | 转发推理、保存日志、提供分析 |
 
@@ -289,7 +289,19 @@ curl -sS "$EDGEGATE_URL/v1/messages" \
   -d '{"model":"claude-sonnet-4-5","max_tokens":64,"messages":[{"role":"user","content":"你好"}]}'
 ```
 
-随后查看 EdgeGate「请求日志」和「总览」，或对应 Cloudflare AI Gateway 控制台。分析数据可能延迟或采样，部分自定义模型的 Token / 费用信息取决于 Cloudflare 支持与定价配置；程序不会在 D1 中另存一份推理日志或补算费用。
+随后查看 EdgeGate「请求日志」和「总览」，或对应 Cloudflare AI Gateway 控制台。分析数据可能延迟或采样，部分自定义模型的 Token / 费用信息取决于 Cloudflare 支持与定价配置；程序在 D1 保存日志元数据与统计快照，不复制请求正文或补算费用。
+
+升级需应用 `0007_observability_cache.sql`，发布 Worker 时保留 `triggers.crons = ["* * * * *"]`。部署后定时任务每分钟检查同步队列；最近日志每 2 分钟、24 小时 / 7 天统计每 5 / 15 分钟更新，首次历史回补可能需要多轮。页面不必保持开启。
+
+在「网关设置 → 数据同步」查看成功时间、失败原因、本地记录范围，并设置 7 / 30 天保留期。CF 控制 API 不可用时继续读取 D1，首次没有快照则显示等待同步。Cron 配置传播可能需要几分钟；点击「立即同步」仅把任务排队，不能代替部署 Cron。
+
+本地 Vite 不会按生产 Cron 自动触发，可在开发服务器运行时手动测试一轮（将端口替换为实际端口）：
+
+```bash
+curl "http://localhost:5173/cdn-cgi/local/scheduled?cron=*+*+*+*+*&format=json"
+```
+
+这是开发服务器专用入口，生产 Worker 没有公开的同步执行接口。`CF_API_TOKEN` 需要在当前环境中配置；本地 D1 与生产 D1 各自保存缓存。
 
 ## 7. 更新、域名和数据
 

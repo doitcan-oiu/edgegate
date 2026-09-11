@@ -7,6 +7,8 @@ import { channels } from './channels';
 import { logs, logDetail, stats } from './observability';
 import { getGatewaySettings, saveGatewaySettings } from './settings';
 import { getErrorTraces } from './upstream-errors';
+import { checkRouteScope, readRouteScope, requireGlobalModelScope, scopeCondition } from './route-scope';
+import { getObservabilityStatus, requestObservabilitySync, saveObservabilitySettings } from './observability-store';
 
 export const admin = new Hono<AppEnv>();
 admin.get('/config', async c => c.json({
@@ -19,6 +21,9 @@ admin.get('/config', async c => c.json({
   dashboard_url: `https://dash.cloudflare.com/${c.env.CLOUDFLARE_ACCOUNT_ID || ''}/ai/ai-gateway`,
 }));
 admin.put('/config/runtime', async c => c.json(await saveGatewaySettings(c.env, await c.req.json())));
+admin.get('/observability', async c => c.json(await getObservabilityStatus(c.env)));
+admin.post('/observability/sync', async c => c.json(await requestObservabilitySync(c.env), 202));
+admin.put('/config/observability', async c => c.json(await saveObservabilitySettings(c.env, await c.req.json())));
 admin.get('/traces/:requestId', async c => {
   const requestId = c.req.param('requestId');
   if (!/^[a-f0-9-]{36}$/i.test(requestId)) throw invalid('请输入有效的 EdgeGate 请求 ID');
@@ -26,25 +31,29 @@ admin.get('/traces/:requestId', async c => {
 });
 admin.route('/', channels);
 admin.get('/models', async c => {
+  const scope = readRouteScope(c), condition = scopeCondition(scope, 'channel_id');
   const [models, routes] = await Promise.all([
     c.env.DB.prepare('SELECT * FROM models ORDER BY created_at, id').all<Model>(),
-    c.env.DB.prepare('SELECT * FROM routes ORDER BY priority, id').all<Route>(),
+    c.env.DB.prepare(`SELECT * FROM routes WHERE ${condition.sql} ORDER BY priority, id`).bind(...condition.values).all<Route>(),
   ]);
-  return c.json(models.results.map(model => ({ ...model, routes: routes.results.filter(route => route.model_id === model.id) })));
+  return c.json(models.results.map(model => ({ ...model, routes: routes.results.filter(route => route.model_id === model.id) })).filter(model => scope.kind === 'all' || model.routes.length));
 });
 admin.post('/models', async c => {
+  requireGlobalModelScope(c);
   const data = modelSchema.parse(await c.req.json());
   if (await c.env.DB.prepare('SELECT id FROM models WHERE id = ?').bind(data.id).first()) throw new ApiError(409, 'conflict', '模型 ID 已存在');
   await c.env.DB.prepare('INSERT INTO models (id, description, enabled) VALUES (?, ?, ?)').bind(data.id, data.description, +data.enabled).run();
   return c.json({ id: data.id }, 201);
 });
 admin.put('/models/:id', async c => {
+  requireGlobalModelScope(c);
   const data = modelSchema.omit({ id: true }).parse(await c.req.json());
   const result = await c.env.DB.prepare('UPDATE models SET description = ?, enabled = ? WHERE id = ?').bind(data.description, +data.enabled, c.req.param('id')).run();
   if (!result.meta.changes) throw new ApiError(404, 'not_found', '模型不存在');
   return c.json({ ok: true });
 });
 admin.delete('/models/:id', async c => {
+  requireGlobalModelScope(c);
   await c.env.DB.prepare('DELETE FROM models WHERE id = ?').bind(c.req.param('id')).run();
   return c.json({ ok: true });
 });
@@ -59,22 +68,31 @@ async function validateRoute(data: ReturnType<typeof routeSchema.parse>, db: D1D
 }
 admin.post('/routes', async c => {
   const data = routeSchema.parse(await c.req.json());
+  await checkRouteScope(c, data.channel_id);
   await validateRoute(data, c.env.DB);
   const id = `rt_${randomToken(12)}`;
-  await c.env.DB.prepare('INSERT INTO routes (id, model_id, channel_id, upstream_model, priority, weight, input_price, output_price, enabled) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(id, data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled).run();
+  const target = scopeCondition(readRouteScope(c), 'id');
+  const result = await c.env.DB.prepare(`INSERT INTO routes (id, model_id, channel_id, upstream_model, priority, weight, input_price, output_price, enabled)
+    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})`)
+    .bind(id, data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, data.channel_id, ...target.values).run();
+  if (!result.meta.changes) throw new ApiError(409, 'route_scope_changed', '渠道范围已变化，请刷新后重试');
   return c.json({ id }, 201);
 });
 admin.put('/routes/:id', async c => {
   const data = routeSchema.parse(await c.req.json()), id = c.req.param('id');
+  await checkRouteScope(c, data.channel_id, id);
   await validateRoute(data, c.env.DB, id);
-  const result = await c.env.DB.prepare('UPDATE routes SET managed_by_provider = 0, model_id = ?, channel_id = ?, upstream_model = ?, priority = ?, weight = ?, input_price = ?, output_price = ?, enabled = ? WHERE id = ?')
-    .bind(data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, id).run();
-  if (!result.meta.changes) throw new ApiError(404, 'not_found', '路由不存在');
+  const scope = readRouteScope(c), source = scopeCondition(scope, 'channel_id'), target = scopeCondition(scope, 'id');
+  const result = await c.env.DB.prepare(`UPDATE routes SET managed_by_provider = 0, model_id = ?, channel_id = ?, upstream_model = ?, priority = ?, weight = ?, input_price = ?, output_price = ?, enabled = ?
+    WHERE id = ? AND ${source.sql} AND EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})`)
+    .bind(data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, id, ...source.values, data.channel_id, ...target.values).run();
+  if (!result.meta.changes) throw new ApiError(scope.kind === 'all' ? 404 : 409, 'route_scope_changed', '路由不存在或标签范围已变化，请刷新后重试');
   return c.json({ ok: true });
 });
 admin.delete('/routes/:id', async c => {
-  await c.env.DB.prepare('DELETE FROM routes WHERE id = ?').bind(c.req.param('id')).run();
+  const scope = readRouteScope(c), condition = scopeCondition(scope, 'channel_id');
+  const result = await c.env.DB.prepare(`DELETE FROM routes WHERE id = ? AND ${condition.sql}`).bind(c.req.param('id'), ...condition.values).run();
+  if (scope.kind !== 'all' && !result.meta.changes) throw new ApiError(409, 'route_scope_changed', '路由已不属于当前标签，请刷新后重试');
   return c.json({ ok: true });
 });
 admin.get('/tags', async c => {
