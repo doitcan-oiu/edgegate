@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
-import { inferenceBody, conversationForRetry, playgroundSnippet, readPlaygroundStream, type PlaygroundMessage } from '../src/playground';
+import { availablePlaygroundModels, inferenceBody, conversationForRetry, playgroundSnippet, readPlaygroundStream, type PlaygroundMessage } from '../src/playground';
 
 const parameters = { model: 'test-model', system: 'answer briefly', temperature: .4, maxTokens: 512, stream: false };
 const conversation: PlaygroundMessage[] = [
   { id: '1', role: 'user', content: 'first question' },
-  { id: '2', role: 'assistant', content: 'first answer', model: 'original-model', requestId: 'private-trace' },
+  { id: '2', role: 'assistant', content: 'first answer', model: 'original-model', requestId: 'private-trace', scopeLabel: 'private-tag' },
   { id: '3', role: 'user', content: 'second question' },
   { id: '4', role: 'assistant', content: 'partial answer', state: 'error', error: 'provider failure' },
 ];
@@ -19,6 +19,7 @@ describe('Playground request preparation', () => {
     const body = inferenceBody({ ...parameters, model: 'another-model' }, [...conversation, { role: 'assistant', content: '' }]);
     expect(body).toEqual({ model: 'another-model', messages: [{ role: 'system', content: 'answer briefly' }, ...conversation.map(({ role, content }) => ({ role, content }))], temperature: .4, max_tokens: 512, stream: false });
     expect(JSON.stringify(body)).not.toContain('private-trace');
+    expect(JSON.stringify(body)).not.toContain('private-tag');
     expect(JSON.stringify(body)).not.toContain('provider failure');
     expect(conversation[1].model).toBe('original-model');
   });
@@ -30,6 +31,25 @@ describe('Playground request preparation', () => {
     expect(snippet.includes('for await')).toBe(stream);
     expect(snippet.includes('console.log(response.choices')).toBe(!stream);
     expect(snippet).toContain('process.env.EDGEGATE_API_KEY');
+  });
+  it('explains API key tag authorization in copied code without inventing public routing parameters', () => {
+    const snippet = playgroundSnippet('https://gateway.example/v1', parameters, conversation, { kind: 'tag', tag: 'AA' });
+    expect(snippet).toContain('仅授权标签 "AA"'); expect(snippet).not.toContain('?tag=');
+    expect(playgroundSnippet('https://gateway.example/v1', parameters, conversation, { kind: 'untagged' })).toContain('暂不支持仅授权未打标签渠道');
+  });
+  it('lists only callable models in the selected tag and never broadens an empty scope', () => {
+    const channels = [
+      { id: 'a', tags: ['AA'], enabled: 1, configured: true }, { id: 'b', tags: ['BB'], enabled: 1, configured: true },
+      { id: 'both', tags: ['AA', 'BB'], enabled: 1, configured: true }, { id: 'u', tags: [], enabled: 1, configured: true },
+      { id: 'off', tags: ['AA'], enabled: 0, configured: true }, { id: 'pending', tags: ['AA'], enabled: 1, configured: false },
+    ];
+    const models = channels.map(channel => ({ id: channel.id, enabled: 1, routes: [{ channel_id: channel.id, enabled: 1 }] }));
+    models.push({ id: 'off-model', enabled: 0, routes: [{ channel_id: 'a', enabled: 1 }] }, { id: 'off-route', enabled: 1, routes: [{ channel_id: 'a', enabled: 0 }] });
+    expect(availablePlaygroundModels(models, channels, { kind: 'tag', tag: 'AA' }).map(model => model.id)).toEqual(['a', 'both']);
+    expect(availablePlaygroundModels(models, channels, { kind: 'tag', tag: 'BB' }).map(model => model.id)).toEqual(['b', 'both']);
+    expect(availablePlaygroundModels(models, channels, { kind: 'untagged' }).map(model => model.id)).toEqual(['u']);
+    expect(availablePlaygroundModels(models, channels, { kind: 'tag', tag: 'removed' })).toEqual([]);
+    expect(availablePlaygroundModels(models, channels, null)).toEqual([]);
   });
 });
 

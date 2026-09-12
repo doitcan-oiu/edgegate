@@ -1,11 +1,12 @@
 import '../playground.css';
 import { ComboBox, ListBox } from '@heroui/react';
-import { memo, useContext, useEffect, useLayoutEffect, useRef, useState, type FormEvent } from 'react';
+import { memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import { ArrowDown, ArrowUp, Code2, Copy, Eraser, RotateCcw, SlidersHorizontal, Square } from 'lucide-react';
 import { copy, RefreshContext, ToastContext, useApi } from '../lib';
-import type { Model } from '../types';
+import type { Model, Channel } from '../types';
+import { routeScopeQuery, type RouteScope } from '../../shared/route-scope';
 import { Button, ErrorBox, Field, Toggle, Input, TextArea, Modal } from '../components';
-import { conversationForRetry, inferenceBody, playgroundSnippet, readPlaygroundStream, type PlaygroundMessage } from '../playground';
+import { availablePlaygroundModels, conversationForRetry, inferenceBody, playgroundSnippet, readPlaygroundStream, type PlaygroundMessage } from '../playground';
 
 const defaultSystem = '你是一个有帮助的 AI 助手。';
 const duration = (ms: number) => ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
@@ -20,25 +21,32 @@ const MessageContent = memo(function MessageContent({ content }: { content: stri
 });
 
 export function Playground() {
-  const models = useApi<Model[]>('/models');
+  const models = useApi<Model[]>('/models'), channels = useApi<Channel[]>('/channels');
+  const [requestedScope, setScope] = useState('');
+  const tags = [...new Set(channels.data?.flatMap(channel => channel.tags) || [])].sort();
+  const scopeOptions = [...tags.map(tag => ({ value: `tag:${tag}`, label: tag })),
+    ...(channels.data?.some(channel => !channel.tags.length) ? [{ value: 'untagged', label: '未打标签' }] : [])];
+  const scopeValue = requestedScope || scopeOptions[0]?.value || '';
+  const scope = useMemo<RouteScope | null>(() => !scopeValue ? null : scopeValue === 'untagged' ? { kind: 'untagged' } : { kind: 'tag', tag: scopeValue.slice(4) }, [scopeValue]);
+  const scopeLabel = scope?.kind === 'tag' ? scope.tag : '未打标签';
+  const missingScope = !!scopeValue && !!channels.data && !scopeOptions.some(option => option.value === scopeValue);
   const [model, setModel] = useState(''), [system, setSystem] = useState(defaultSystem), [temperature, setTemperature] = useState('0.7'), [maxTokens, setMaxTokens] = useState('1024'), [stream, setStream] = useState(true);
   const [draft, setDraft] = useState(''), [messages, setMessages] = useState<PlaygroundMessage[]>([]), [busy, setBusy] = useState(false), [error, setError] = useState('');
   const [elapsed, setElapsed] = useState(0), [showCode, setShowCode] = useState(false), [showParams, setShowParams] = useState(() => window.innerWidth >= 1000), [awayFromBottom, setAwayFromBottom] = useState(false);
   const controller = useRef<AbortController | null>(null), chatScroll = useRef<HTMLDivElement>(null), composer = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true), started = useRef(0), mounted = useRef(true);
   const { refresh } = useContext(RefreshContext), notify = useContext(ToastContext);
-  const enabledModels = models.data?.filter(item => item.enabled) || [];
-  const selectedModel = enabledModels.find(item => item.id === model);
-  const parameters = { model, system, temperature: Number(temperature), maxTokens: Number(maxTokens), stream };
+  const enabledModels = useMemo(() => availablePlaygroundModels(models.data || [], channels.data || [], scope), [models.data, channels.data, scope]);
+  const selectedModel = enabledModels.find(item => item.id === model) || enabledModels[0];
+  const modelId = selectedModel?.id || '';
+  const parameters = { model: modelId, system, temperature: Number(temperature), maxTokens: Number(maxTokens), stream };
   const parameterError = !temperature.trim() || !Number.isFinite(parameters.temperature) || parameters.temperature < 0 || parameters.temperature > 2
     ? 'Temperature 需在 0–2 之间。' : !maxTokens.trim() || !Number.isInteger(parameters.maxTokens) || parameters.maxTokens < 1 || parameters.maxTokens > 32768 ? '最大输出需为 1–32768 的整数。' : '';
-  const canRequest = !!selectedModel && selectedModel.routes.some(route => route.enabled) && !parameterError;
+  const canRequest = !!scope && !!selectedModel && !models.error && !channels.error && !parameterError;
   const lastResponse = [...messages].reverse().find(message => message.role === 'assistant');
 
-  useEffect(() => {
-    if (!models.data || busy) return;
-    setModel(previous => models.data!.some(item => item.id === previous && item.enabled) ? previous : models.data!.find(item => item.enabled && item.routes.some(route => route.enabled))?.id || models.data!.find(item => item.enabled)?.id || '');
-  }, [models.data, busy]);
+  useEffect(() => { if (scopeValue && !requestedScope) setScope(scopeValue); }, [scopeValue, requestedScope]);
+  useEffect(() => { if (!busy) setModel(modelId); }, [modelId, busy]);
   useEffect(() => { mounted.current = true; return () => { mounted.current = false; controller.current?.abort(); }; }, []);
   useEffect(() => {
     if (!busy) return;
@@ -59,9 +67,9 @@ export function Playground() {
   function resetConversation() { setMessages([]); setError(''); setElapsed(0); toBottom(); focusDraft(); }
 
   async function generate(conversation: PlaygroundMessage[]) {
-    if (controller.current || !canRequest) { if (parameterError) setError(parameterError); return; }
+    if (controller.current || !canRequest || !scope) { if (parameterError) setError(parameterError); return; }
     const abort = new AbortController(); controller.current = abort;
-    const assistant: PlaygroundMessage = { id: crypto.randomUUID(), role: 'assistant', model, content: '', state: 'pending' };
+    const assistant: PlaygroundMessage = { id: crypto.randomUUID(), role: 'assistant', model: modelId, scopeLabel, content: '', state: 'pending' };
     const update = (patch: Partial<PlaygroundMessage>) => {
       Object.assign(assistant, patch);
       if (mounted.current) setMessages([...conversation, { ...assistant }]);
@@ -69,7 +77,7 @@ export function Playground() {
     stickToBottom.current = true; setAwayFromBottom(false);
     setBusy(true); setError(''); setElapsed(0); started.current = performance.now(); update({});
     try {
-      const response = await fetch('/api/playground', { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', signal: abort.signal,
+      const response = await fetch(`/api/playground${routeScopeQuery(scope)}`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, credentials: 'same-origin', signal: abort.signal,
         body: JSON.stringify(inferenceBody(parameters, conversation)),
       });
       update({ requestId: response.headers.get('X-Request-ID') || '', attempts: Number(response.headers.get('X-Gateway-Attempts')) || undefined });
@@ -107,15 +115,20 @@ export function Playground() {
     if (conversation.length) void generate(conversation);
   }
   const codeMessages = draft.trim() ? [...messages, { role: 'user' as const, content: draft.trim() }] : conversationForRetry(messages);
-  const snippet = playgroundSnippet(`${location.origin}/v1`, parameters, codeMessages.length ? codeMessages : [{ role: 'user', content: '你好' }]);
+  const snippet = playgroundSnippet(`${location.origin}/v1`, parameters, codeMessages.length ? codeMessages : [{ role: 'user', content: '你好' }], scope);
 
   return <div className="playground-page">
-    <header className="playground-heading"><div><h1>Playground</h1><span>模型调试</span></div><div className="playground-heading-actions"><Button type="button" variant="secondary" disabled={!!parameterError || !model} onClick={() => setShowCode(true)}><Code2 size={15} />调用代码</Button><Button type="button" variant="secondary" aria-expanded={showParams} aria-controls="playground-parameters" onClick={() => setShowParams(!showParams)}><SlidersHorizontal size={15} />{showParams ? '收起参数' : '请求参数'}</Button></div></header>
+    <header className="playground-heading"><div><h1>Playground</h1><span>模型调试</span></div><div className="playground-heading-actions"><Button type="button" variant="secondary" disabled={!!parameterError || !modelId} onClick={() => setShowCode(true)}><Code2 size={15} />调用代码</Button><Button type="button" variant="secondary" aria-expanded={showParams} aria-controls="playground-parameters" onClick={() => setShowParams(!showParams)}><SlidersHorizontal size={15} />{showParams ? '收起参数' : '请求参数'}</Button></div></header>
     <div className={`playground-workspace ${showParams ? '' : 'parameters-collapsed'}`}>
       <section className="chat-panel" aria-label="模型对话">
+        <div className="playground-tags" role="group" aria-label="选择调试标签">
+          {scopeOptions.map(option => <Button key={option.value} type="button" variant="ghost" disabled={busy} aria-pressed={scopeValue === option.value} onClick={() => { if (!controller.current) { setScope(option.value); setError(''); } }}>{option.label}</Button>)}
+          {missingScope && <Button type="button" variant="ghost" disabled aria-pressed>{scopeLabel}（已移除）</Button>}
+          {!scopeOptions.length && !missingScope && <span>{channels.loading ? '加载标签…' : channels.error ? '标签加载失败' : '请先添加渠道并设置标签'}</span>}
+        </div>
         <div className="chat-toolbar">
-          <ComboBox className="playground-model" aria-label="选择或搜索模型" value={model || null} onChange={value => { if (value) { setModel(String(value)); setError(''); } }} defaultItems={enabledModels} isDisabled={busy || models.loading && !models.data} allowsEmptyCollection>
-            <ComboBox.InputGroup><Input placeholder={models.loading ? '加载模型…' : '搜索并选择模型'} /><ComboBox.Trigger aria-label="展开模型列表" /></ComboBox.InputGroup>
+          <ComboBox key={scopeValue} className="playground-model" aria-label="选择或搜索模型" value={modelId || null} onChange={value => { if (value) { setModel(String(value)); setError(''); } }} defaultItems={enabledModels} isDisabled={busy || !scope || !!models.error || !!channels.error || models.loading && !models.data || channels.loading && !channels.data} allowsEmptyCollection>
+            <ComboBox.InputGroup><Input placeholder={models.loading || channels.loading ? '加载模型…' : '搜索当前标签的模型'} /><ComboBox.Trigger aria-label="展开模型列表" /></ComboBox.InputGroup>
             <ComboBox.Popover className="playground-model-options"><ListBox renderEmptyState={() => <span className="model-search-empty">没有匹配的模型</span>}>{(item: Model) => <ListBox.Item id={item.id} textValue={item.id}><span>{item.id}</span><ListBox.ItemIndicator /></ListBox.Item>}</ListBox></ComboBox.Popover>
           </ComboBox>
           <span className="playground-mode">{stream ? '流式' : 'JSON'}</span>
@@ -123,8 +136,8 @@ export function Playground() {
         </div>
         <div className="chat-transcript">
           <div className="chat-messages" ref={chatScroll} onScroll={event => { const node = event.currentTarget; const away = node.scrollHeight - node.clientHeight - node.scrollTop > 64; stickToBottom.current = !away; setAwayFromBottom(away); }}>
-            {!messages.length ? <div className="chat-welcome"><h2>发送消息，开始调试</h2><p>选择模型后直接输入，切换模型会保留对话上下文。</p><div className="prompt-suggestions">{[{ label: '测试文本', text: '用三句话介绍 Cloudflare Workers' }, { label: '测试代码', text: '写一个 TypeScript 快速排序函数' }].map(prompt => <button type="button" key={prompt.label} onClick={() => { setDraft(prompt.text); focusDraft(); }}>{prompt.label}<ArrowUp size={13} /></button>)}</div></div>
-              : messages.map((message, index) => <article className={`chat-message ${message.role}`} key={message.id}><header><strong title={message.model}>{message.role === 'user' ? '你' : message.model}</strong><div className="message-actions">{message.content && <Button type="button" variant="ghost" className="icon-btn" aria-label={`复制第 ${index + 1} 条消息`} onClick={() => copy(message.content, notify)}><Copy size={14} /></Button>}{message.role === 'assistant' && index === messages.length - 1 && !busy && <Button type="button" variant="ghost" disabled={!canRequest} onClick={regenerate}><RotateCcw size={13} />{message.state === 'error' ? '重试' : '重新生成'}</Button>}</div></header>
+            {!messages.length ? <div className="chat-welcome"><h2>发送消息，开始调试</h2><p>选择标签和模型后输入消息，切换时保留对话上下文。</p><div className="prompt-suggestions">{[{ label: '测试文本', text: '用三句话介绍 Cloudflare Workers' }, { label: '测试代码', text: '写一个 TypeScript 快速排序函数' }].map(prompt => <button type="button" key={prompt.label} onClick={() => { setDraft(prompt.text); focusDraft(); }}>{prompt.label}<ArrowUp size={13} /></button>)}</div></div>
+              : messages.map((message, index) => <article className={`chat-message ${message.role}`} key={message.id}><header><div className="message-identity"><strong title={message.model}>{message.role === 'user' ? '你' : message.model}</strong>{message.scopeLabel && <span title={message.scopeLabel}>{message.scopeLabel}</span>}</div><div className="message-actions">{message.content && <Button type="button" variant="ghost" className="icon-btn" aria-label={`复制第 ${index + 1} 条消息`} onClick={() => copy(message.content, notify)}><Copy size={14} /></Button>}{message.role === 'assistant' && index === messages.length - 1 && !busy && <Button type="button" variant="ghost" disabled={!canRequest} onClick={regenerate}><RotateCcw size={13} />{message.state === 'error' ? '重试' : '重新生成'}</Button>}</div></header>
                 {message.content ? <MessageContent content={message.content} /> : message.state === 'pending' ? <p className="message-placeholder" role="status">正在等待模型响应…</p> : message.state === 'complete' ? <p className="message-placeholder">响应已完成，未返回文本内容。</p> : null}
                 {message.error && <ErrorBox message={message.error} />}{message.state === 'stopped' && <p className="message-placeholder">已停止生成{message.content ? '，已保留收到的内容。' : '。'}</p>}
                 {message.role === 'assistant' && message.state !== 'pending' && <div className="message-meta"><span>{duration(message.elapsed || 0)}</span>{message.attempts && <span>{message.attempts} 次上游请求</span>}{message.requestId && <Button type="button" variant="ghost" aria-label={`复制第 ${index + 1} 条消息的请求 ID`} onClick={() => copy(message.requestId!, notify)}>请求 ID<Copy size={12} /></Button>}</div>}
@@ -132,8 +145,8 @@ export function Playground() {
           </div>
           {awayFromBottom && <Button type="button" variant="secondary" className="chat-to-bottom" onClick={toBottom}><ArrowDown size={13} />回到最新</Button>}
         </div>
-        <div className="chat-compose" ref={composer}><ErrorBox message={error || models.error || parameterError} />
-          {!models.loading && !canRequest && !parameterError && !models.error && <p className="playground-unavailable">{selectedModel ? '此模型尚无已启用的路由。' : '暂无可用模型。'}<a href="#models">管理模型与路由</a></p>}
+        <div className="chat-compose" ref={composer}><ErrorBox message={error || models.error || channels.error || parameterError} />
+          {!models.loading && !channels.loading && !canRequest && !parameterError && !models.error && !channels.error && <p className="playground-unavailable">{scope ? '当前标签下暂无已配置且启用的模型路由。' : '请先添加渠道并设置标签。'}<a href="#models">管理模型与路由</a></p>}
           <form onSubmit={send}><TextArea aria-label="输入消息" placeholder={busy ? '可以先输入下一条消息…' : '输入消息…'} value={draft} onChange={event => setDraft(event.target.value)} rows={2} maxLength={16000} onKeyDown={event => {
             if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing && event.nativeEvent.keyCode !== 229) {
               event.preventDefault(); if (!busy) event.currentTarget.form?.requestSubmit();
@@ -150,6 +163,6 @@ export function Playground() {
         </div><p className="playground-usage-note">使用管理员会话，计入真实上游用量。<br />每分钟 30 次，每日 1,000 次。</p>
       </aside>}
     </div>
-    {showCode && <Modal title="调用代码" description="代码使用当前模型、系统提示词、参数和待发送消息；没有草稿时使用最近一轮请求。" onClose={() => setShowCode(false)} wide><div className="playground-code-heading"><span>JavaScript · OpenAI SDK</span><Button type="button" variant="secondary" onClick={() => copy(snippet, notify)}><Copy size={14} />复制代码</Button></div><pre className="playground-code"><code>{snippet}</code></pre></Modal>}
+    {showCode && <Modal title="调用代码" description="代码使用当前模型、系统提示词、参数和待发送消息；没有草稿时使用最近一轮请求。实际渠道范围由应用 API Key 的标签授权决定。" onClose={() => setShowCode(false)} wide><div className="playground-code-heading"><span>JavaScript · OpenAI SDK</span><Button type="button" variant="secondary" onClick={() => copy(snippet, notify)}><Copy size={14} />复制代码</Button></div><pre className="playground-code"><code>{snippet}</code></pre></Modal>}
   </div>;
 }

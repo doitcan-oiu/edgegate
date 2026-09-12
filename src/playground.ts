@@ -1,9 +1,20 @@
+import { matchesRouteScope, type RouteScope } from '../shared/route-scope';
+import type { Channel, Model } from './types';
+
 export type ConversationMessage = { role: 'user' | 'assistant'; content: string };
 export type PlaygroundMessage = ConversationMessage & {
   id: string; model?: string; state?: 'pending' | 'complete' | 'stopped' | 'error'; error?: string;
-  requestId?: string; elapsed?: number; attempts?: number;
+  requestId?: string; elapsed?: number; attempts?: number; scopeLabel?: string;
 };
 export interface PlaygroundParameters { model: string; system: string; temperature: number; maxTokens: number; stream: boolean }
+
+export function availablePlaygroundModels<T extends Pick<Model, 'enabled'> & { routes: Pick<Model['routes'][number], 'enabled' | 'channel_id'>[] }>(
+  models: T[], channels: Pick<Channel, 'id' | 'tags' | 'enabled' | 'configured'>[], scope: RouteScope | null,
+) {
+  if (!scope) return [];
+  const ids = new Set(channels.filter(channel => channel.enabled && channel.configured && matchesRouteScope(channel.tags, scope)).map(channel => channel.id));
+  return models.filter(model => model.enabled && model.routes.some(route => route.enabled && ids.has(route.channel_id)));
+}
 
 export function inferenceBody(parameters: PlaygroundParameters, messages: ConversationMessage[]) {
   return {
@@ -18,8 +29,10 @@ export function conversationForRetry<T extends ConversationMessage>(messages: T[
   return lastUser < 0 ? [] : messages.slice(0, lastUser + 1);
 }
 
-export function playgroundSnippet(baseURL: string, parameters: PlaygroundParameters, messages: ConversationMessage[]) {
-  return `import OpenAI from "openai";\n\nconst client = new OpenAI({\n  baseURL: ${JSON.stringify(baseURL)},\n  apiKey: process.env.EDGEGATE_API_KEY,\n});\n\nconst response = await client.chat.completions.create(${JSON.stringify(inferenceBody(parameters, messages), null, 2)});\n\n${parameters.stream
+export function playgroundSnippet(baseURL: string, parameters: PlaygroundParameters, messages: ConversationMessage[], scope?: RouteScope | null) {
+  const scopeNote = scope?.kind === 'tag' ? `// 使用仅授权标签 ${JSON.stringify(scope.tag)} 的 API Key，才能复现当前渠道范围。\n`
+    : scope?.kind === 'untagged' ? '// API Key 暂不支持仅授权未打标签渠道；本示例的实际范围由 API Key 授权决定。\n' : '';
+  return `import OpenAI from "openai";\n\n${scopeNote}const client = new OpenAI({\n  baseURL: ${JSON.stringify(baseURL)},\n  apiKey: process.env.EDGEGATE_API_KEY,\n});\n\nconst response = await client.chat.completions.create(${JSON.stringify(inferenceBody(parameters, messages), null, 2)});\n\n${parameters.stream
     ? 'for await (const chunk of response) {\n  process.stdout.write(chunk.choices[0]?.delta?.content ?? "");\n}'
     : 'console.log(response.choices[0]?.message?.content ?? "");'}`;
 }

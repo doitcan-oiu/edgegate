@@ -590,6 +590,47 @@ describe('Cloudflare observability synchronized to D1', () => {
   });
 });
 
+describe('Playground tag routing', () => {
+  const playground = (query: string, model = 'shared') => request(`/api/playground${query}`, { admin: true, body: { model, messages: [{ role: 'user', content: 'test' }], stream: false } });
+  it('routes shared models within the selected tag, including untagged and multi-tag channels', async () => {
+    const a = await catalog('Pga', 'openai', ['AA', 'AB'], ['shared', 'a-only']);
+    const b = await catalog('Pgb', 'openai', ['BB'], ['shared']);
+    const untagged = await catalog('Pgu', 'openai', [], ['shared']);
+    await db.prepare('UPDATE routes SET priority = 10 WHERE channel_id = ?').bind(a.channelId).run();
+    for (const [query, id] of [['?tag=AA', a.channelId], ['?tag=AB', a.channelId], ['?tag=BB', b.channelId], ['?untagged=1', untagged.channelId]]) {
+      calls = []; const response = await playground(query); expect(response.status).toBe(200); await response.text();
+      expect(calls).toHaveLength(1); expect(JSON.parse(calls[0].headers['cf-aig-metadata']).channel_id).toBe(id);
+      expect(calls[0].body).not.toHaveProperty('tag'); expect(calls[0].body).not.toHaveProperty('untagged');
+    }
+    calls = [];
+    expect((await playground('?tag=BB', 'a-only')).status).toBe(503);
+    expect((await playground('?tag=removed')).status).toBe(503); expect(calls).toHaveLength(0);
+  });
+  it('keeps every retry within the tag even when another tag has healthy routes', async () => {
+    const a = await catalog('Pgretrya', 'openai', ['AA'], ['shared']);
+    const a2 = await catalog('Pgretryb', 'openai', ['AA'], ['shared']);
+    await catalog('Pgretryoutside', 'openai', ['BB'], ['shared']);
+    await runtime({ same_channel_retries: 1, cross_channel_retries: 3 });
+    upstream = req => req.url.includes('custom-pgretryoutside/') ? MFResponse.json(completion) : MFResponse.json({ error: 'busy' }, { status: 503 });
+    expect((await playground('?tag=AA')).status).toBe(502);
+    expect(calls).toHaveLength(4);
+    expect(new Set(calls.map(call => JSON.parse(call.headers['cf-aig-metadata']).channel_id))).toEqual(new Set([a.channelId, a2.channelId]));
+  });
+  it('validates admin scopes without changing public API key permissions', async () => {
+    const a = await catalog('Pgkeya', 'openai', ['AA'], ['shared']);
+    await catalog('Pgkeyb', 'openai', ['BB'], ['shared']);
+    for (const query of ['?tag=', '?tag=AA&untagged=1', '?untagged=0', `?tag=${'a'.repeat(41)}`]) {
+      expect((await playground(query)).status).toBe(400);
+    }
+    expect(calls).toHaveLength(0);
+    expect((await request('/api/playground?tag=AA', { body: { model: 'shared', messages: [{ role: 'user', content: 'test' }] } })).status).toBe(401);
+    const token = (await key({ allowed_tags: ['AA'] })).key;
+    const result = await request('/v1/chat/completions?tag=BB&untagged=1', { key: token, body: { model: 'shared', messages: [{ role: 'user', content: 'test' }] } });
+    expect(result.status).toBe(200); await result.text();
+    expect(JSON.parse(calls[0].headers['cf-aig-metadata']).channel_id).toBe(a.channelId);
+  });
+});
+
 describe('local crypto and routing rules', () => {
   it('binds encrypted credentials to a channel', async () => { const value = await encryptSecret('secret', ENCRYPTION, 'a'); expect(await decryptSecret(value, ENCRYPTION, 'a')).toBe('secret'); await expect(decryptSecret(value, ENCRYPTION, 'b')).rejects.toThrow(); });
   it('orders priorities and weights without duplicate attempts', () => { const values = [{ id: 'a', priority: 0, weight: 1 }, { id: 'b', priority: 0, weight: 9 }, { id: 'c', priority: 1, weight: 1000 }] as Candidate[]; expect(orderCandidates(values, () => 0.5).map(c => c.id)).toEqual(['b', 'a', 'c']); });

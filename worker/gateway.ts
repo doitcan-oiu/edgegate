@@ -11,6 +11,8 @@ import { convertStream } from './protocols/stream';
 import { forwardStream } from './protocols/error-stream';
 import { getGatewaySettings } from './settings';
 import { publicUpstreamError, readUpstreamFailure, recordUpstreamFailure, upstreamFailure } from './upstream-errors';
+import { readRouteScope } from './route-scope';
+import { matchesRouteScope } from '../shared/route-scope';
 
 async function retryPause(ms: number, signal: AbortSignal) {
   if (signal.aborted) return;
@@ -28,20 +30,22 @@ export async function listModels(c: Context<AppEnv>) {
   return c.json({ object: 'list', data: results.filter(m => accessible.has(m.id) && canUseModel(key, m.id)).map(m => ({ id: m.id, object: 'model', created: Math.floor(Date.parse(m.created_at) / 1000), owned_by: 'edgegate' })) });
 }
 export async function chat(c: Context<AppEnv>, playground = false, protocol: Protocol = 'openai'): Promise<Response> {
+  const scope = playground ? readRouteScope(c) : null;
   const key: Pick<ApiKey, 'id' | 'name' | 'rpm' | 'daily_limit' | 'allowed_models' | 'allowed_tags'> = playground
     ? { id: 'playground', name: 'Playground', rpm: 30, daily_limit: 1000, allowed_models: '[]', allowed_tags: '[]' }
     : await authenticateKey(c.req.raw, c.env);
   const input = (protocol === 'anthropic' ? messagesSchema : chatSchema).parse(await c.req.json()) as InferenceInput;
   if (!canUseModel(key, input.model)) throw new ApiError(403, 'model_not_allowed', '该密钥没有此模型的访问权限');
   const allowedTags = JSON.parse(key.allowed_tags) as string[];
-  const [available, settings] = await Promise.all([getCandidates(c.env, input.model, allowedTags), getGatewaySettings(c.env)]);
+  const [accessible, settings] = await Promise.all([getCandidates(c.env, input.model, allowedTags), getGatewaySettings(c.env)]);
+  const available = scope ? accessible.filter(candidate => matchesRouteScope(candidate.channel.tags || [], scope)) : accessible;
   if (allowedTags.length && !available.length) throw new ApiError(403, 'model_not_allowed', '该密钥的标签范围内没有此模型的可用服务商');
   const limit = await consumeLimit(c.env, key.id, key.rpm, key.daily_limit);
   if (!limit.allowed) { c.header('Retry-After', String(limit.retryAfter)); throw new ApiError(429, 'rate_limited', '已达到请求频率或每日请求上限'); }
   const requestId = c.get('requestId');
   let attempts = 0, channelsTried = 0;
   const candidates = orderCandidates(available, Math.random, settings.load_balancing);
-  if (!candidates.length) { throw new ApiError(503, 'no_available_route', '此模型没有已配置且启用的渠道，请检查渠道凭据和模型路由'); }
+  if (!candidates.length) { throw new ApiError(503, 'no_available_route', scope && scope.kind !== 'all' ? '当前标签范围内没有此模型的可用路由，请检查渠道配置和启用状态' : '此模型没有已配置且启用的渠道，请检查渠道凭据和模型路由'); }
   let lastFailure = upstreamFailure(null, '', 'upstream_unavailable');
   let conversionError: ApiError | undefined;
   for (const candidate of candidates) {
