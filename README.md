@@ -150,12 +150,13 @@ curl https://YOUR-WORKER.workers.dev/v1/messages \
 
 协议存在差异，当前边界如下：
 
-- 同协议请求保留原协议扩展。跨协议不支持的参数（如扩展 thinking、提示缓存控制、服务端工具、音频、Anthropic 不支持的 JSON response_format、多候选 `n > 1`、Anthropic `top_k`）返回明确的 `unsupported_conversion`。存在同协议可用路由时可跳过无法转换的候选。
-- OpenAI → Anthropic 未指定输出长度时使用 `max_tokens=4096`；Anthropic 的温度范围要求为 0–1，程序不悄悄截断超出范围的温度。实际模型仍可能有更严格要求。
+- 同协议请求保留原协议扩展。跨协议转换只发送目标协议可映射的参数，其余可选参数自动省略，例如 `frequency_penalty`、`presence_penalty`、缓存提示、扩展 thinking、Anthropic 不支持的 JSON `response_format` / `top_k`。转换到只支持单个结果的协议时省略 `n`，请求仍正常发送。不支持的工具定义及其强制选择也会省略，保留可转换的函数工具。
+- OpenAI → Anthropic 未指定输出长度时使用 `max_tokens=4096`；超出转换器支持范围 0–1 的 `temperature` 会省略，由上游使用默认值。同时提供 `max_completion_tokens` 与 `max_tokens` 时，优先使用 `max_completion_tokens`。每次故障转移都从原始请求重新转换，不会影响后续同协议渠道接收原参数。
+- 消息正文、图片、工具调用参数与结果仍需正确且可转换；无法表示的实际内容返回 `unsupported_conversion`，可继续尝试其他匹配协议的渠道。上游响应与 SSE 完整性校验保持生效，不会通过丢弃回答内容来伪造成功。
 - Anthropic 客户端调用 OpenAI 服务商时，流式请求会向上游请求 `include_usage`。Anthropic 的初始流式计数从 0 开始，结束事件更新为上游报告值；若上游缺少必要用量、缺少结束事件或出现无法表示的内容，转换会报错。不会自行补算用量或账单；后台仍会同步 Cloudflare 实际报告的记录。
 - 供应商认证按上游协议选择：OpenAI Chat Completions / Responses 使用 Bearer，Anthropic 使用 `x-api-key`。故障转移时按候选渠道重新选择密钥和认证头。其他私有认证方式尚不支持；已有 BYOK 模式使用 Cloudflare 对应的凭据配置。
 
-Responses 的函数工具跨协议转换时，应显式填写 `strict: true` 或 `strict: false`；省略且无法确认等价严格语义的 schema 会被拒绝。转换到 Anthropic 时使用 `strict: false`，避免将 OpenAI 严格 schema 的保证静默降级。非空 reasoning、引用注释及加密推理内容需使用原生 Responses 渠道。
+Responses 与 Chat Completions 之间保留显式的函数工具 `strict`。Responses 未指定时，已符合严格模式的 schema 使用 `true`，其他 schema 使用 `false`；转换到 Anthropic 时省略 `strict` 约束，保留函数名与 schema。跨协议会省略不支持的 `background`、存储、流式扩展和格式选项；实际非空 reasoning、加密推理内容及无法转换的上游输出仍需匹配协议的渠道。
 
 Responses 调用示例（使用应用 API Key，模型填写本程序的公开模型 ID）：
 
@@ -168,7 +169,7 @@ curl https://YOUR-WORKER.workers.dev/v1/responses \
 
 Responses 与 Chat Completions 之间会转换 `input` / `messages`、`instructions`、`max_output_tokens`、函数工具与调用结果、`text.format` / `response_format` 和 usage；Anthropic 通过 Chat Completions 作为中间格式转换。Responses SSE 使用 `response.created`、`response.output_text.delta`、函数参数事件和 `response.completed` / `response.incomplete`，不会把 Chat Completions 的 `[DONE]` 冒充 Responses 终止事件。原生流里的 `response.failed` 和嵌套上游错误也受「上游错误展示」配置控制，管理员追踪保留原始错误。
 
-本次实现 `POST /v1/responses`，不提供 Responses 的查询、删除、取消、压缩端点或 WebSocket。跨协议转换要求客户端通过 `input` 传完整上下文；`previous_response_id`、`conversation`、内建工具及其他无法表示的扩展仅能交给原生 Responses 上游。引用上游会话时，当前模型授权范围内必须只有一个可用 Responses 渠道，并保持渠道和凭据不变；程序不会跨渠道续接或自动管理上游会话。`background` / 存储等原生能力的后续操作需要在对应上游完成。协议字段和流事件依据 [OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses) 与 [SSE 指南](https://developers.openai.com/api/docs/guides/streaming-responses)。
+本次实现 `POST /v1/responses`，不提供 Responses 的查询、删除、取消、压缩端点或 WebSocket。跨协议转换要求客户端通过 `input` 传完整上下文；`previous_response_id`、`conversation`、`prompt` 模板及 `item_reference` 等引用的上下文只能交给原生 Responses 上游，不能作为普通调参省略。内建工具与其他可选扩展在跨协议时会省略，要使用这些能力应选择原生 Responses 上游。引用上游会话时，当前模型授权范围内必须只有一个可用 Responses 渠道，并保持渠道和凭据不变；程序不会跨渠道续接或自动管理上游会话。`background` / 存储等原生能力的后续操作需要在对应上游完成。协议字段和流事件依据 [OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses) 与 [SSE 指南](https://developers.openai.com/api/docs/guides/streaming-responses)。
 
 ## 服务商标签与模型并集
 
@@ -222,20 +223,20 @@ Playground 同样通过标签按钮选择调试范围，只列出该范围中已
 
 | 内容 | 同步频率 / 保留 |
 | --- | --- |
-| 最近 5 分钟日志 | 每 2 分钟，优先最新记录 |
-| 最近 2 小时日志复查 | 每 15 分钟，更新长 SSE 等延迟数据 |
+| 最新日志 | 每 2 分钟从第一页读取最新 4 页 |
+| 近期日志复查 | 每 15 分钟安排分页重读，按本地 2 小时回看边界复查长 SSE 等延迟数据 |
 | 24 小时 / 7 天统计快照 | 每 5 / 15 分钟 |
-| 历史日志 | 按 6 小时时间段分批回补，补完后持续填补缺口，并每天安排历史复查 |
-| 日志保留期 | 默认 7 天，可在「网关设置 → 数据同步」切换 30 天 |
+| 历史日志 | 从最新向前分批分页，读取到本地保留边界或 CF 页尾后结束本轮，定期重扫 |
+| 本地日志保留期 | 默认 7 天，可在「网关设置 → 数据同步」切换 30 天，边界在本地判断 |
 
-- Cron 每分钟检查到期任务，不需要保持网页或电脑开启。每类任务使用 D1 原子租约，单轮有页数及时间预算；未完成的进度下一轮继续。高流量或 CF 接口慢时，同步会滞后，页面显示成功时间和状态。
+- Cron 每分钟检查到期任务，不需要保持网页或电脑开启。每类任务使用 D1 原子租约，单轮有页数及时间预算；近期复查与历史分页跨轮续扫时重叠读取一页，最新日志每轮重新从第一页读取。高流量或 CF 接口慢时，同步会滞后，页面显示成功时间和状态。
 - 「立即同步」通过 `POST /api/observability/sync` 将请求持久化到 D1，在下一分钟的 Cron 开始；重复点击会合并。任务不依赖 HTTP 请求结束后的 `waitUntil` 寿命。`GET /api/observability` 读取同步进度，`PUT /api/config/observability` 设置日志保留期。
-- 日志以 Cloudflare log ID 去重更新，不以 EdgeGate request ID 合并重试。分页固定时间边界并重叠重读，保存元数据与页进度的操作为原子批次；较早发出但较晚返回的同步结果不能覆盖更新的观察值。CF API 没有稳定快照游标或明确的入库延迟保证，重读降低漏记风险，不能恢复 CF 未采集、已删除的记录。
+- 所有日志同步请求按 `created_at` 降序分页，不向 Cloudflare 传开始 / 结束日期筛选。日志以 Cloudflare log ID 去重更新，不以 EdgeGate request ID 合并重试；重复读取近期页面可更新长 SSE 请求结束后的状态、用量等数据。保存元数据与页进度的操作为原子批次，较早发出但较晚返回的同步结果不能覆盖更新的观察值。CF API 没有稳定快照游标或明确的入库延迟保证，分页过程中新增或删除记录会使页面位置变化；扫描进度与记录时间不表示已完整覆盖某个时间范围，重读降低漏记风险，不能恢复 CF 未采集、已删除的记录。
 - 渠道卡片显示最近 1 小时的分段可用率，共 30 块，每块代表 2 分钟。`GET /api/channels/availability` 按日志中的渠道 ID 从 D1 汇总成功率，同名渠道互不混用；缓存命中、缺少成功状态或渠道 ID 的记录不参与统计。重试按各次上游尝试计算，灰色表示无有效样本。这是已同步请求的成功率，不是主动探测在线率；同步延迟和历史回补会单独标示。升级前缓存中缺少渠道 ID 的记录需等待后台重新同步后才会计入。
-- 本地只缓存列表与现有详情需要的元数据，不复制请求 / 响应正文、认证头。缺失的状态、Token 或费用显示「未报告」或 `—`。本地总条数、筛选和分页只针对已同步且在保留期内的记录；可以查看最早记录及历史回补进度。
+- 本地只缓存列表与现有详情需要的元数据，不复制请求 / 响应正文、认证头。缺失的状态、Token 或费用显示「未报告」或 `—`。本地总条数、筛选和分页只针对已同步且在保留期内的记录；可以查看最早记录及历史分页进度。
 - 统计来自 GraphQL 的整个网关聚合，不以本地日志条数补算请求量、用量和费用。快照保留自身的起止时间，图表按该时间窗口绘制，过期快照不会把尚未同步的时段画成 0。
 - 同步失败保留最后成功的快照与日志；首次没有快照时显示等待同步及错误，不伪造零流量。数据按 Account / Gateway 隔离，Token 轮换保留同一资源的缓存。KV 仅用于会话及分析 Schema 字段缓存。
-- 保留期缩短后立即按新范围查询，Cron 分批清理过期行；再次延长会重新回补，并撤销旧日志任务租约，避免过时进度覆盖新范围。保留更多日志会增加 D1 存储、写入与 CF 读取次数，请根据请求量选择。
+- 7 / 30 天保留期用于本地日志保留、展示和过期清理；扫描时也在本地判断是否已读到保留边界，不作为上游日志请求的日期条件。缩短后立即按新范围查询，Cron 分批清理过期行；再次延长会重新扫描，并撤销旧日志任务租约，避免沿用过时进度。保留更多日志会增加 D1 存储与写入，向前扫描也会增加 CF 读取次数，请根据请求量选择。
 
 - 范围为当前 AI Gateway 的全部调用，包含其他客户端。一次 EdgeGate 请求发生故障转移时，可能生成多条 Cloudflare 日志。
 - 通过 `cf-aig-metadata` 传递请求 ID、应用 Key ID/名称、模型别名、渠道与尝试序号。返回 `X-Request-ID`、`X-Gateway-Attempts`，以及上游提供的 `cf-aig-log-id`，便于关联。

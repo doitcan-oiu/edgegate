@@ -2,16 +2,13 @@ import type { Protocol } from '../types';
 import { ApiError } from '../lib/errors';
 import { chatRequestToResponses, chatResponseToResponses, responsesRequestToChat, responsesResponseToChat, validateResponsesResponse } from './responses';
 
-// Protocol boundaries accept provider extensions; cross-protocol conversion validates
-// the fields it can represent and rejects the rest instead of losing instructions.
+// Native requests retain provider extensions. Cross-protocol requests explicitly
+// map supported options and omit the rest, while validating message/tool content.
 export type ObjectValue = Record<string, any>;
 export type InferenceInput = ObjectValue & { model: string; stream: boolean };
 type MessageInput = InferenceInput & { messages: ObjectValue[] };
 export const incompatible = (field: string) => new ApiError(400, 'unsupported_conversion', `跨协议转换不支持 ${field}，请使用同协议服务商或移除此参数`);
 export const badResponse = () => new ApiError(502, 'invalid_upstream_response', '上游响应不符合目标协议或包含无法转换的内容');
-function fields(value: ObjectValue, allowed: string[], context: string) {
-  for (const key of Object.keys(value)) if (value[key] != null && !allowed.includes(key)) throw incompatible(`${context}.${key}`);
-}
 function object(value: unknown): ObjectValue {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw incompatible('JSON 对象');
   return value as ObjectValue;
@@ -38,13 +35,12 @@ function openaiContent(value: unknown, images = true): ObjectValue[] {
   if (value == null) return [];
   if (typeof value === 'string') return value ? [{ type: 'text', text: value }] : [];
   return list(value).map(part => {
-    if (part.type === 'text') { fields(part, ['type', 'text'], 'content'); return { type: 'text', text: text(part.text) }; }
+    if (part.type === 'text') return { type: 'text', text: text(part.text) };
     if (images && part.type === 'image_url') return imageToAnthropic(part);
     throw incompatible(`content.${part.type}`);
   });
 }
 function anthropicContent(part: ObjectValue, images = true): ObjectValue {
-  if (part.cache_control || part.citations?.length) throw incompatible('cache_control / citations');
   if (part.type === 'text') return { type: 'text', text: text(part.text) };
   if (images && part.type === 'image') {
     const source = object(part.source);
@@ -54,9 +50,6 @@ function anthropicContent(part: ObjectValue, images = true): ObjectValue {
   throw incompatible(`content.${part.type}`);
 }
 function toAnthropic(input: InferenceInput): MessageInput {
-  fields(input, ['model', 'messages', 'stream', 'max_tokens', 'max_completion_tokens', 'temperature', 'top_p', 'stop', 'tools', 'tool_choice', 'parallel_tool_calls', 'n', 'stream_options', 'user'], 'request');
-  if (input.n != null && input.n !== 1) throw incompatible('n > 1');
-  if (input.temperature != null && (input.temperature < 0 || input.temperature > 1)) throw incompatible('Anthropic temperature 范围为 0–1');
   const messages: ObjectValue[] = [], system: ObjectValue[] = [];
   const add = (role: string, content: ObjectValue[]) => {
     const previous = messages.at(-1);
@@ -64,11 +57,17 @@ function toAnthropic(input: InferenceInput): MessageInput {
     else messages.push({ role, content });
   };
   for (const message of list(input.messages)) {
-    fields(message, ['role', 'content', 'tool_calls', 'tool_call_id'], 'message');
+    // These fields contain actual conversation content, unlike optional names,
+    // cache hints or sampling options. Do not silently erase that content.
+    if (message.audio || message.reasoning_content || message.function_call) throw incompatible('message.audio / reasoning_content / function_call');
     if (['system', 'developer'].includes(message.role)) { system.push(...openaiContent(message.content, false)); continue; }
     if (message.role === 'tool') { add('user', [{ type: 'tool_result', tool_use_id: text(message.tool_call_id), content: openaiContent(message.content) }]); continue; }
     if (!['user', 'assistant'].includes(message.role)) throw incompatible(`role.${message.role}`);
     const content = openaiContent(message.content, message.role === 'user');
+    if (message.refusal != null) {
+      if (message.role !== 'assistant') throw incompatible('message.refusal');
+      content.push({ type: 'text', text: text(message.refusal) });
+    }
     for (const call of message.tool_calls ? list(message.tool_calls) : []) {
       if (message.role !== 'assistant' || call.type !== 'function') throw incompatible('tool_calls');
       content.push({ type: 'tool_use', id: text(call.id), name: text(call.function?.name), input: argumentsObject(call.function?.arguments) });
@@ -79,37 +78,38 @@ function toAnthropic(input: InferenceInput): MessageInput {
   const result: MessageInput = { model: input.model, messages, stream: input.stream, max_tokens: input.max_completion_tokens ?? input.max_tokens ?? 4096 };
   if (system.length) result.system = system;
   if (input.user != null) result.metadata = { user_id: text(input.user) };
-  for (const key of ['temperature', 'top_p']) if (input[key] != null) result[key] = input[key];
+  if (typeof input.temperature === 'number' && input.temperature >= 0 && input.temperature <= 1) result.temperature = input.temperature;
+  if (input.top_p != null) result.top_p = input.top_p;
   if (input.stop != null) result.stop_sequences = typeof input.stop === 'string' ? [input.stop] : input.stop;
-  if (input.tools) result.tools = list(input.tools).map(tool => {
-    if (tool.type !== 'function') throw incompatible('非 function 工具');
-    const fn = object(tool.function); fields(fn, ['name', 'description', 'parameters', 'strict'], 'tool.function');
-    if (fn.strict === true) throw incompatible('tool.strict');
-    return { name: text(fn.name), ...(fn.description ? { description: text(fn.description) } : {}), input_schema: fn.parameters || { type: 'object', properties: {} } };
-  });
-  const choice = input.tool_choice;
-  if (typeof choice === 'string') {
-    if (!['auto', 'none', 'required'].includes(choice)) throw incompatible('tool_choice');
-    result.tool_choice = { type: choice === 'required' ? 'any' : choice };
-  } else if (choice) {
-    if (choice.type !== 'function') throw incompatible('tool_choice');
-    result.tool_choice = { type: 'tool', name: text(choice.function?.name) };
+  if (input.tools) {
+    const tools = list(input.tools).filter(tool => tool.type === 'function').map(tool => {
+      const fn = object(tool.function);
+      return { name: text(fn.name), ...(fn.description ? { description: text(fn.description) } : {}), input_schema: fn.parameters || { type: 'object', properties: {} } };
+    });
+    if (tools.length) result.tools = tools;
   }
-  if (typeof input.parallel_tool_calls === 'boolean' && result.tools?.length) result.tool_choice = { ...(result.tool_choice || { type: 'auto' }), disable_parallel_tool_use: !input.parallel_tool_calls };
+  const choice = input.tool_choice;
+  if (result.tools?.length) {
+    if (typeof choice === 'string' && ['auto', 'none', 'required'].includes(choice)) {
+      result.tool_choice = { type: choice === 'required' ? 'any' : choice };
+    } else if (choice?.type === 'function' && result.tools.some((tool: ObjectValue) => tool.name === choice.function?.name)) {
+      result.tool_choice = { type: 'tool', name: text(choice.function.name) };
+    }
+    if (typeof input.parallel_tool_calls === 'boolean') result.tool_choice = { ...(result.tool_choice || { type: 'auto' }), disable_parallel_tool_use: !input.parallel_tool_calls };
+  }
   return result;
 }
 function toOpenAI(input: InferenceInput): MessageInput {
-  fields(input, ['model', 'messages', 'stream', 'max_tokens', 'system', 'temperature', 'top_p', 'stop_sequences', 'tools', 'tool_choice', 'metadata'], 'request');
   const messages: ObjectValue[] = [];
   if (input.system) messages.push({ role: 'system', content: typeof input.system === 'string' ? input.system : list(input.system).map(p => anthropicContent(p, false)) });
   for (const message of list(input.messages)) {
-    fields(message, ['role', 'content'], 'message');
+    if (!['user', 'assistant'].includes(message.role)) throw incompatible('message.role');
     if (typeof message.content === 'string') { messages.push({ role: message.role, content: message.content }); continue; }
     const blocks = list(message.content);
     if (message.role === 'assistant') {
       const content: ObjectValue[] = [], calls: ObjectValue[] = [];
       for (const block of blocks) {
-        if (block.type === 'tool_use') { fields(block, ['type', 'id', 'name', 'input'], 'tool_use'); calls.push({ type: 'function', id: text(block.id), function: { name: text(block.name), arguments: JSON.stringify(object(block.input)) } }); }
+        if (block.type === 'tool_use') { calls.push({ type: 'function', id: text(block.id), function: { name: text(block.name), arguments: JSON.stringify(object(block.input)) } }); }
         else content.push(anthropicContent(block, false));
       }
       messages.push({ role: 'assistant', content: content.length ? content.map(p => p.text).join('') : null, ...(calls.length ? { tool_calls: calls } : {}) });
@@ -118,7 +118,7 @@ function toOpenAI(input: InferenceInput): MessageInput {
       const flush = () => { if (content.length) { messages.push({ role: 'user', content }); content = []; } };
       for (const block of blocks) {
         if (block.type === 'tool_result') {
-          fields(block, ['type', 'tool_use_id', 'content', 'is_error'], 'tool_result'); flush();
+          flush();
           const result = typeof block.content === 'string' ? block.content : list(block.content || []).map(p => anthropicContent(p, false));
           messages.push({ role: 'tool', tool_call_id: text(block.tool_use_id), content: block.is_error ? JSON.stringify({ is_error: true, content: result }) : result });
         } else content.push(anthropicContent(block));
@@ -127,18 +127,19 @@ function toOpenAI(input: InferenceInput): MessageInput {
     }
   }
   const result: MessageInput = { model: input.model, messages, stream: input.stream, max_tokens: input.max_tokens };
-  if (input.metadata) { fields(object(input.metadata), ['user_id'], 'metadata'); if (input.metadata.user_id != null) result.user = text(input.metadata.user_id); }
+  if (input.metadata) { const metadata = object(input.metadata); if (metadata.user_id != null) result.user = text(metadata.user_id); }
   for (const key of ['temperature', 'top_p']) if (input[key] != null) result[key] = input[key];
   if (input.stop_sequences) result.stop = input.stop_sequences;
-  if (input.tools) result.tools = list(input.tools).map(tool => {
-    fields(tool, ['name', 'description', 'input_schema'], 'tool');
-    return { type: 'function', function: { name: text(tool.name), ...(tool.description ? { description: text(tool.description) } : {}), parameters: object(tool.input_schema) } };
-  });
-  if (input.tool_choice) {
-    const choice = object(input.tool_choice); fields(choice, ['type', 'name', 'disable_parallel_tool_use'], 'tool_choice');
-    if (choice.type === 'tool') result.tool_choice = { type: 'function', function: { name: text(choice.name) } };
+  if (input.tools) {
+    const tools = list(input.tools).filter(tool => tool.type == null || tool.type === 'custom').map(tool => ({
+      type: 'function', function: { name: text(tool.name), ...(tool.description ? { description: text(tool.description) } : {}), parameters: object(tool.input_schema) },
+    }));
+    if (tools.length) result.tools = tools;
+  }
+  if (input.tool_choice && result.tools?.length) {
+    const choice = object(input.tool_choice);
+    if (choice.type === 'tool' && result.tools.some((tool: ObjectValue) => tool.function.name === choice.name)) result.tool_choice = { type: 'function', function: { name: text(choice.name) } };
     else if (['auto', 'none', 'any'].includes(choice.type)) result.tool_choice = choice.type === 'any' ? 'required' : choice.type;
-    else throw incompatible('tool_choice');
     if (typeof choice.disable_parallel_tool_use === 'boolean') result.parallel_tool_calls = !choice.disable_parallel_tool_use;
   }
   if (input.stream) result.stream_options = { include_usage: true };
@@ -152,10 +153,6 @@ export function convertRequest(input: InferenceInput, from: Protocol, to: Protoc
   if (from === 'responses') {
     const chat = responsesRequestToChat(input);
     if (to === 'openai') return chat;
-    // Anthropic has no response storage; empty metadata carries no instructions.
-    if (chat.store === false) delete chat.store;
-    if (chat.metadata && typeof chat.metadata === 'object' && !Object.keys(chat.metadata).length) delete chat.metadata;
-    if (chat.response_format?.type === 'text') delete chat.response_format;
     return toAnthropic(chat);
   }
   return to === 'anthropic' ? toAnthropic(input) : toOpenAI(input);

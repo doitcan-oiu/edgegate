@@ -49,11 +49,66 @@ describe('bidirectional protocol requests', () => {
     expect(convertRequest(input, 'anthropic', 'anthropic')).toEqual(input);
     expect(convertRequest({ ...oa, response_format: { type: 'json_object' } }, 'openai', 'openai')).toHaveProperty('response_format');
   });
-  it.each([{ n: 2 }, { temperature: 1.5 }, { response_format: { type: 'json_object' } }, { audio: { voice: 'alloy' } }, { messages: [{ role: 'assistant', tool_calls: [{ type: 'function', id: 't', function: { name: 'f', arguments: 'not-json' } }] }] }])('rejects unsupported OpenAI semantics explicitly: %j', input => {
-    expect(() => convertRequest({ ...oa, ...input }, 'openai', 'anthropic')).toThrow(/跨协议/);
+  it.each([
+    { frequency_penalty: 0.6 }, { presence_penalty: 0.5 }, { logit_bias: { '1': 10 } }, { seed: 42 }, { logprobs: true, top_logprobs: 2 },
+    { n: 2 }, { temperature: 1.5 }, { response_format: { type: 'json_object' } }, { audio: { voice: 'alloy' } },
+    { reasoning_effort: 'high' }, { vendor_option: { enabled: true } },
+  ])('omits unmapped OpenAI options while retaining the conversation: %j', patch => {
+    const input = { ...oa, ...patch }, original = structuredClone(input);
+    expect(convertRequest(input, 'openai', 'anthropic')).toEqual(convertRequest(oa, 'openai', 'anthropic'));
+    expect(input).toEqual(original);
+    expect(convertRequest(input, 'openai', 'openai')).toEqual(original);
   });
-  it.each([{ thinking: { type: 'enabled' } }, { top_k: 8 }, { tools: [{ type: 'web_search_20250305', name: 'web_search' }] }, { messages: [{ role: 'user', content: [{ type: 'text', text: 'cache', cache_control: { type: 'ephemeral' } }] }] }])('does not silently lose Anthropic semantics: %j', input => {
-    expect(() => convertRequest({ ...ant, ...input }, 'anthropic', 'openai')).toThrow(/跨协议/);
+  it('preserves supported options, message text and schema when dropping ancillary hints', () => {
+    const input = { ...oa, temperature: 0, top_p: 0.8, max_tokens: 50, max_completion_tokens: 100,
+      tools: [{ type: 'web_search' }, { type: 'function', function: { name: 'weather', parameters: schema, strict: true, cache_control: { type: 'ephemeral' } } }],
+      tool_choice: { type: 'function', function: { name: 'weather', vendor_hint: true } }, parallel_tool_calls: false,
+      messages: [{ role: 'user', name: 'speaker', content: [{ type: 'text', text: '你好', cache_control: { type: 'ephemeral' } }] }] };
+    const original = structuredClone(input), result = convertRequest(input, 'openai', 'anthropic');
+    expect(result).toMatchObject({ temperature: 0, top_p: 0.8, max_tokens: 100, messages: [{ role: 'user', content: [{ type: 'text', text: '你好' }] }],
+      tools: [{ name: 'weather', input_schema: schema }], tool_choice: { type: 'tool', name: 'weather', disable_parallel_tool_use: true } });
+    expect(result.tools).toHaveLength(1);
+    expect(result.tools[0]).not.toHaveProperty('strict');
+    expect(result.tools[0]).not.toHaveProperty('cache_control');
+    expect(input).toEqual(original);
+  });
+  it.each([{ thinking: { type: 'enabled' } }, { top_k: 8 }, { service_tier: 'auto' }, { vendor_option: true }])('omits unmapped Anthropic options: %j', patch => {
+    const input = { ...ant, ...patch }, original = structuredClone(input);
+    expect(convertRequest(input, 'anthropic', 'openai')).toEqual(convertRequest(ant, 'anthropic', 'openai'));
+    expect(input).toEqual(original);
+  });
+  it('retains Anthropic text, tools and user ID without forwarding cache controls or metadata extensions', () => {
+    const input = { ...ant, metadata: { user_id: 'app-user', vendor_hint: true },
+      system: [{ type: 'text', text: '规则', cache_control: { type: 'ephemeral' } }],
+      tools: [{ type: 'custom', name: 'weather', input_schema: schema, cache_control: { type: 'ephemeral' } }, { type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{ role: 'user', content: [{ type: 'text', text: '你好', cache_control: { type: 'ephemeral' } }] }] };
+    const original = structuredClone(input), result = convertRequest(input, 'anthropic', 'openai');
+    expect(result).toMatchObject({ user: 'app-user', messages: [{ role: 'system', content: [{ type: 'text', text: '规则' }] }, { role: 'user', content: [{ type: 'text', text: '你好' }] }],
+      tools: [{ type: 'function', function: { name: 'weather', parameters: schema } }] });
+    expect(result.tools).toHaveLength(1);
+    expect(JSON.stringify(result)).not.toContain('cache_control');
+    expect(result).not.toHaveProperty('metadata');
+    expect(input).toEqual(original);
+  });
+  it('omits tool choices whose unsupported tools were removed', () => {
+    const openai = convertRequest({ ...oa, tools: [{ type: 'web_search' }], tool_choice: 'required', parallel_tool_calls: false }, 'openai', 'anthropic');
+    expect(openai).not.toHaveProperty('tools'); expect(openai).not.toHaveProperty('tool_choice');
+    const anthropic = convertRequest({ ...ant, tools: [{ name: 'weather', input_schema: schema }, { type: 'web_search_20250305', name: 'web_search' }], tool_choice: { type: 'tool', name: 'web_search' } }, 'anthropic', 'openai');
+    expect(anthropic.tools).toHaveLength(1); expect(anthropic).not.toHaveProperty('tool_choice');
+  });
+  it('retains assistant refusal text in Anthropic history', () => {
+    expect(convertRequest({ ...oa, messages: [{ role: 'assistant', content: null, refusal: '无法回答' }] }, 'openai', 'anthropic').messages[0].content).toEqual([{ type: 'text', text: '无法回答' }]);
+  });
+  it.each([
+    { messages: [{ role: 'assistant', tool_calls: [{ type: 'function', id: 't', function: { name: 'f', arguments: 'not-json' } }] }] },
+    { messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'abc', format: 'wav' } }] }] },
+    { messages: [{ role: 'assistant', content: '你好', reasoning_content: 'actual reasoning' }] },
+    { messages: [{ role: 'user', content: [{ type: 'text', text: 7 }] }] },
+  ])('still validates actual OpenAI message and tool content: %j', patch => {
+    expect(() => convertRequest({ ...oa, ...patch }, 'openai', 'anthropic')).toThrow(/跨协议/);
+  });
+  it('still rejects unrepresentable Anthropic message content', () => {
+    expect(() => convertRequest({ ...ant, messages: [{ role: 'assistant', content: [{ type: 'thinking', thinking: 'reasoning content' }] }] }, 'anthropic', 'openai')).toThrow(/跨协议/);
   });
 });
 describe('bidirectional JSON responses', () => {

@@ -5,7 +5,7 @@ import { Button, ErrorBox, Field, Loading, Select } from './components';
 import type { ObservabilityStatus, SyncJobName, SyncJobStatus } from '../shared/observability';
 import './observability.css';
 
-const names: Record<SyncJobName, string> = { 'stats:24h': '24 小时统计', 'stats:7d': '7 天统计', 'logs:head': '最新日志', 'logs:repair': '近期日志复查', 'logs:history': '历史日志回补' };
+const names: Record<SyncJobName, string> = { 'stats:24h': '24 小时统计', 'stats:7d': '7 天统计', 'logs:head': '最新日志', 'logs:repair': '近期日志复查', 'logs:history': '历史日志分页' };
 function stateText(job: SyncJobStatus) {
   return job.state === 'running' ? '同步中' : job.state === 'queued' ? '已排队' : job.state === 'error' ? '同步失败' : job.state === 'waiting' ? '等待首次同步' : job.stale ? '数据待更新' : '已同步';
 }
@@ -46,7 +46,7 @@ export function ObservabilitySync({ settings = false, jobs = ['stats:24h', 'logs
       <Button variant="secondary" disabled={busy || active} onClick={sync}><RefreshCw size={14} />{busy ? '提交中…' : active ? '同步已安排' : '立即同步'}</Button>
     </div>
     <ErrorBox message={error || status.error} />
-    {settings && <p className="sync-help">定时从 Cloudflare 获取数据，网页关闭后仍会同步。接口失败时继续显示上次成功的数据。</p>}
+    {settings && <p className="sync-help">优先获取 Cloudflare 最新日志，并分批读取较早的记录。关闭网页后仍会同步，接口失败时保留上次成功的数据。</p>}
     {settings && status.loading && !status.data ? <Loading /> : <div className="sync-jobs">{visible.map(job => <div className={`sync-job ${job.state === 'error' ? 'has-error' : ''}`} key={job.job}>
       <span>{names[job.job]}</span><span className="sync-job-state">{stateText(job)}</span><time>{job.last_success_at ? time(job.last_success_at) : '暂无成功记录'}</time>
       {settings && job.last_attempt_at && <small>最近尝试 {time(job.last_attempt_at)}</small>}
@@ -54,10 +54,10 @@ export function ObservabilitySync({ settings = false, jobs = ['stats:24h', 'logs
     </div>)}</div>}
     {settings && status.data && <>
       <div className="sync-cadence"><span>最新日志 <strong>2 分钟</strong></span><span>24 小时统计 <strong>5 分钟</strong></span><span>7 天统计 <strong>15 分钟</strong></span></div>
-      <div className="sync-retention"><Field label="日志保留期" hint="延长后自动回补仍可从 Cloudflare 查询的日志；缩短后立即按新范围展示，并分批清理过期数据。"><Select value={String(retention ?? status.data.settings.log_retention_days)} disabled={saving} onChange={value => setRetention(Number(value) as 7 | 30)}><option value="7">7 天</option><option value="30">30 天</option></Select></Field><Button disabled={saving || retention === null || retention === status.data.settings.log_retention_days} onClick={save}>{saving ? '保存中…' : '保存保留期'}</Button></div>
-      <div className="sync-coverage"><strong>本地已同步 {number(status.data.logs.total)} 条日志</strong><span>{status.data.logs.oldest_at ? `最早记录 ${time(status.data.logs.oldest_at)}` : '尚无本地记录'}</span><span>{status.data.logs.backfilling ? '历史日志正在分批回补' : '历史范围已扫描'}</span>{status.data.logs.covered_from && status.data.logs.covered_to && <span>已扫描 {time(status.data.logs.covered_from)} 至 {time(status.data.logs.covered_to)}</span>}</div>
-      <p className="sync-help">近期日志会反复读取，更新长 SSE 请求的最终状态与用量。统计保持 Cloudflare 全网关口径；本地日志条数只代表已同步且在保留期内的记录。Cloudflare 未采集或已删除的数据无法补回。</p>
+      <div className="sync-retention"><Field label="日志保留期" hint="控制本地日志保留多久。延长后补读仍可获取的记录；缩短后按新范围展示并分批清理。"><Select value={String(retention ?? status.data.settings.log_retention_days)} disabled={saving} onChange={value => setRetention(Number(value) as 7 | 30)}><option value="7">7 天</option><option value="30">30 天</option></Select></Field><Button disabled={saving || retention === null || retention === status.data.settings.log_retention_days} onClick={save}>{saving ? '保存中…' : '保存保留期'}</Button></div>
+      <div className="sync-coverage"><strong>本地已同步 {number(status.data.logs.total)} 条日志</strong><span>{status.data.logs.oldest_at ? `最早记录 ${time(status.data.logs.oldest_at)}` : '尚无本地记录'}</span><span>{status.data.logs.backfilling ? '历史分页读取中' : '本轮分页扫描已结束'}</span></div>
+      <p className="sync-help">已有日志会更新长 SSE 请求的最终状态与用量。远端记录可能延迟出现，后台会重复读取。统计保持 Cloudflare 全网关口径；本地条数只包含已同步且在保留期内的记录。Cloudflare 未采集或已删除的数据无法补回。</p>
     </>}
-    {!settings && <p className="sync-caption">{status.data?.logs.backfilling && jobs.includes('logs:head') ? '历史日志回补中 · ' : ''}后台自动同步，页面刷新读取缓存<a href="#settings">网关设置</a></p>}
+    {!settings && <p className="sync-caption">{status.data?.logs.backfilling && jobs.includes('logs:head') ? '历史分页读取中 · ' : ''}后台自动同步，页面刷新读取缓存<a href="#settings">网关设置</a></p>}
   </div>;
 }

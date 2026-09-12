@@ -22,17 +22,19 @@ export function normalizeLog(log: GatewayLog) {
     upstream_model: log.model, provider: log.provider, source: 'cloudflare',
   };
 }
-export async function fetchLogPage(env: Env, start: string, end: string, page: number, direction: 'asc' | 'desc' = 'asc') {
-  // Documented scalar bounds remain supported by the REST API. Overlap boundaries
-  // because filtering precision and inclusive/exclusive semantics can differ.
+export async function fetchLogPage(env: Env, page: number) {
+  // Read the live log list newest first. Retention and SSE lookback are local
+  // stopping conditions, not upstream date filters.
   const params = new URLSearchParams({ page: String(page), per_page: '50', order_by: 'created_at',
-    order_by_direction: direction, meta_info: 'true', start_date: new Date(Date.parse(start) - 1000).toISOString(), end_date: end });
+    order_by_direction: 'desc', meta_info: 'true' });
   const response = await cfApi<GatewayLog[]>(env, `${gatewayPath(env)}/logs?${params}`);
   if (!Array.isArray(response.result) || response.result.some(log => !log.id || !Number.isFinite(Date.parse(log.created_at)))) {
     throw new ApiError(502, 'cloudflare_invalid_response', 'Cloudflare 日志列表格式异常');
   }
+  const info = response.result_info;
   return { logs: response.result.map(log => ({ ...normalizeLog(log), created_at: new Date(log.created_at).toISOString() })),
-    has_more: response.result_info?.total_pages != null ? page < response.result_info.total_pages : response.result.length === 50 };
+    has_more: info?.total_pages != null ? page < info.total_pages
+      : info?.total_count != null ? page * 50 < info.total_count : response.result.length === 50 };
 }
 
 type Metrics = { tokensIn?: number; tokensOut?: number; cost?: number; erroredRequests?: number; cachedRequests?: number };

@@ -82,32 +82,124 @@ describe('Responses nonstream request conversion', () => {
     expect(reversed.response_format).toEqual({ type: 'json_schema', json_schema: jsonSchema });
     expect(reversed.reasoning_effort).toBe('low');
   });
-  it('honors explicit strictness and requires a known strict schema when Responses omits strict', () => {
+  it('preserves explicit tool strictness and infers a safe default without rewriting the schema', () => {
     expect(convertRequest({ ...request, tools: [{ ...tool, strict: true }] }, 'responses', 'openai').tools[0].function.strict).toBe(true);
+    expect(convertRequest({ ...request, tools: [tool] }, 'responses', 'openai').tools[0].function.strict).toBe(false);
     const { strict: _, ...implicit } = tool;
     expect(convertRequest({ ...request, tools: [implicit] }, 'responses', 'openai').tools[0].function.strict).toBe(true);
-    expect(() => convertRequest({ ...request, tools: [{ ...implicit, parameters: { type: 'object', properties: {} } }] }, 'responses', 'openai')).toThrow(/strict/);
+    expect(convertRequest({ ...request, tools: [{ ...implicit, parameters: {} }] }, 'responses', 'openai').tools[0].function.strict).toBe(false);
+    expect(convertRequest({ ...request, tools: [{ type: 'function', name: 'weather' }] }, 'responses', 'openai').tools[0].function.strict).toBe(false);
+    const optionalSchema = { type: 'object', properties: { city: { type: 'string', default: '北京', 'x-vendor': 'keep' } } };
+    const input = { ...request, tools: [{ ...implicit, parameters: optionalSchema, cache_control: { type: 'ephemeral' } }] };
+    const before = structuredClone(input);
+    expect(convertRequest(input, 'responses', 'openai').tools).toEqual([{ type: 'function', function: { name: 'weather', parameters: optionalSchema, strict: false } }]);
+    expect(input).toEqual(before);
   });
   it('allows stateless replay of empty reasoning markers with complete message output', () => {
     const input = { ...request, input: [{ type: 'reasoning', id: 'rs_1', summary: [] }, message, { role: 'user', content: '继续' }] };
     expect(convertRequest(input, 'responses', 'openai').messages.map(m => m.role)).toEqual(['assistant', 'user']);
   });
+  it('omits unsupported Responses tuning and nested metadata without mutating the source', () => {
+    const input = { ...request, stream: true, store: true, background: true, truncation: 'auto', include: ['reasoning.encrypted_content'],
+      vendor_option: { enabled: true }, frequency_penalty: 0.7, stream_options: { include_obfuscation: true, vendor: 'extra' },
+      reasoning: { effort: 'low', summary: 'auto', vendor: 'extra' }, text: { verbosity: 'high', format: { type: 'text', vendor: true } },
+      input: [{ ...message, phase: 'commentary', cache_control: { type: 'ephemeral' }, content: [{ type: 'output_text', text: '你好', annotations: [{ type: 'url_citation', url: 'https://example.com' }], logprobs: [{}], vendor: true }] },
+        { role: 'user', content: [{ type: 'input_text', text: '继续', prompt_cache_breakpoint: { mode: 'explicit' } }] }] };
+    const before = structuredClone(input);
+    expect(convertRequest(input, 'responses', 'openai')).toEqual({ model: 'm', stream: true,
+      messages: [{ role: 'assistant', content: [{ type: 'text', text: '你好' }] }, { role: 'user', content: [{ type: 'text', text: '继续' }] }],
+      reasoning_effort: 'low', response_format: { type: 'text' }, stream_options: { include_usage: true } });
+    expect(input).toEqual(before);
+    expect(convertRequest(input, 'responses', 'responses')).toEqual(before);
+    expect(convertRequest({ ...request, store: false }, 'responses', 'openai').store).toBe(false);
+  });
+  it('omits unsupported Chat tuning and favors max_completion_tokens over max_tokens', () => {
+    const input = { ...chat, n: 3, frequency_penalty: 0.8, presence_penalty: 0.4, stop: ['END'], audio: { voice: 'alloy' },
+      store: true, logprobs: true, max_tokens: 10, max_completion_tokens: 20, vendor_option: { enabled: true }, stream_options: { include_usage: true, vendor: true },
+      messages: [{ role: 'user', name: 'speaker', cache_control: { type: 'ephemeral' }, content: [{ type: 'text', text: '你好', vendor: true }] }] };
+    const before = structuredClone(input);
+    expect(convertRequest(input, 'openai', 'responses')).toEqual({ model: 'm', stream: false, store: false, max_output_tokens: 20,
+      input: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: '你好' }] }] });
+    expect(input).toEqual(before);
+    expect(convertRequest(input, 'openai', 'openai')).toEqual(before);
+  });
+  it('maps supported schema fields while preserving the entire schema body', () => {
+    const extended = { ...schema, 'x-vendor': { arbitrary: ['keep', { nested: true }] } };
+    const input = { ...chat, tools: [{ type: 'function', vendor: true, function: { name: 'weather', parameters: extended, strict: false, cache_control: { type: 'ephemeral' } } }],
+      response_format: { type: 'json_schema', vendor: true, json_schema: { name: 'weather', schema: extended, strict: false, vendor: true } } };
+    const before = structuredClone(input);
+    const converted = convertRequest(input, 'openai', 'responses');
+    expect(converted.tools).toEqual([{ type: 'function', name: 'weather', parameters: extended, strict: false }]);
+    expect(converted.text).toEqual({ format: { type: 'json_schema', name: 'weather', schema: extended, strict: false } });
+    const reversed = convertRequest({ ...converted, tools: converted.tools.map((entry: ObjectValue) => ({ ...entry, vendor: true })),
+      text: { format: { ...converted.text.format, vendor: true }, verbosity: 'high' } }, 'responses', 'openai');
+    expect(reversed.tools).toEqual([{ type: 'function', function: { name: 'weather', parameters: extended, strict: false } }]);
+    expect(reversed.response_format).toEqual({ type: 'json_schema', json_schema: { name: 'weather', schema: extended, strict: false } });
+    expect(input).toEqual(before);
+  });
+  it.each(['responses', 'openai'] as const)('keeps function tools and drops choices referencing removed %s tools', from => {
+    const to = from === 'responses' ? 'openai' : 'responses';
+    const base = from === 'responses' ? request : chat;
+    const supportedTool = from === 'responses' ? tool : { type: 'function', function: { name: 'weather', parameters: schema, strict: false } };
+    const removedTool = { type: 'web_search', name: 'search', vendor: true };
+    const choice = (name: string) => from === 'responses' ? { type: 'function', name, vendor: true } : { type: 'function', function: { name, vendor: true }, vendor: true };
+    const mixed = { ...base, tools: [removedTool, supportedTool], tool_choice: choice('weather') };
+    const before = structuredClone(mixed);
+    const result = convertRequest(mixed, from, to);
+    expect(result.tools).toHaveLength(1);
+    expect(result.tool_choice).toEqual(to === 'responses' ? { type: 'function', name: 'weather' } : { type: 'function', function: { name: 'weather' } });
+    expect(mixed).toEqual(before);
+    for (const tool_choice of [choice('search'), { type: 'web_search' }, { type: 'allowed_tools', tools: [removedTool] }, 'vendor_mode']) {
+      expect(convertRequest({ ...mixed, tool_choice }, from, to)).not.toHaveProperty('tool_choice');
+    }
+    for (const tools of [[], [removedTool]]) {
+      const empty = convertRequest({ ...base, tools, tool_choice: 'required' }, from, to);
+      expect(empty).not.toHaveProperty('tools');
+      expect(empty).not.toHaveProperty('tool_choice');
+    }
+    expect(convertRequest({ ...base, tool_choice: 'required' }, from, to)).not.toHaveProperty('tool_choice');
+    for (const tool_choice of ['auto', 'none', 'required']) expect(convertRequest({ ...mixed, tool_choice }, from, to).tool_choice).toBe(tool_choice);
+  });
+  it('omits unknown format modes and uses the default for unknown image detail', () => {
+    const image = 'https://example.com/a.png';
+    const converted = convertRequest({ ...chat, response_format: { type: 'vendor_format', options: {} },
+      messages: [{ role: 'user', content: [{ type: 'image_url', image_url: { url: image, detail: 'original', vendor: true }, cache_control: { type: 'ephemeral' } }] }] }, 'openai', 'responses');
+    expect(converted).not.toHaveProperty('text');
+    expect(converted.input[0].content).toEqual([{ type: 'input_image', image_url: image, detail: 'auto' }]);
+    const reversed = convertRequest({ ...request, text: { verbosity: 'high', format: { type: 'vendor_format' } }, reasoning: { summary: 'auto' },
+      input: [{ role: 'user', content: [{ type: 'input_image', image_url: image, detail: 'original', vendor: true }] }] }, 'responses', 'openai');
+    expect(reversed).not.toHaveProperty('response_format');
+    expect(reversed).not.toHaveProperty('reasoning_effort');
+    expect(reversed.messages[0].content).toEqual([{ type: 'image_url', image_url: { url: image } }]);
+  });
+  it.each([{ previous_response_id: 'resp_old' }, { conversation: 'conv_old' }, { prompt: { id: 'pmpt_saved', variables: { location: '北京' } } }])('does not silently drop referenced context: %j', patch => {
+    expect(() => convertRequest({ ...request, ...patch }, 'responses', 'openai')).toThrow(expect.objectContaining({ code: 'unsupported_conversion', status: 400 }));
+    expect(() => convertRequest({ ...chat, ...patch }, 'openai', 'responses')).toThrow(expect.objectContaining({ code: 'unsupported_conversion', status: 400 }));
+  });
   it.each([
-    { previous_response_id: 'resp_old' }, { conversation: 'conv_old' }, { background: true }, { store: true }, { truncation: 'auto' },
-    { tools: [{ type: 'web_search' }] }, { include: ['reasoning.encrypted_content'] }, { reasoning: { summary: 'auto' } }, { text: { verbosity: 'high' } },
     { input: [{ type: 'item_reference', id: 'msg_old' }] }, { input: [{ type: 'reasoning', id: 'rs_1', summary: [{ type: 'summary_text', text: 'summary' }] }] },
     { input: [{ type: 'reasoning', id: 'rs_1', summary: [], encrypted_content: 'private-state' }] },
     { input: [{ role: 'user', content: [{ type: 'input_image', file_id: 'file_1' }] }] },
-    { input: [{ role: 'user', content: [{ type: 'input_image', image_url: 'https://example.com/a.png', detail: 'original' }] }] },
-    { input: [{ role: 'user', content: [{ type: 'input_text', text: 'cache', prompt_cache_breakpoint: { mode: 'explicit' } }] }] },
-    { input: [{ ...message, phase: 'commentary' }] }, { input: [{ ...call, status: 'in_progress' }] },
+    { input: [{ ...call, status: 'in_progress' }] }, { input: [{ ...call, arguments: {} }] }, { input: [{ ...call, call_id: undefined }] },
     { input: [{ type: 'function_call_output', call_id: 'call_1', output: [{ type: 'input_image', image_url: 'https://example.com/a.png' }] }] },
-  ])('rejects unsupported Responses input semantics: %j', patch => {
+    { input: [{ role: 'user', content: [{ type: 'input_text' }] }] }, { input: [{ role: 'user', content: [{ type: 'input_audio' }] }] },
+    { tools: [{ type: 'function', name: 'weather', parameters: [] }] }, { tools: [{ type: 'function', parameters: schema }] },
+    { tools: [{ ...tool, strict: 'yes' }] }, { text: { format: { type: 'json_schema', name: 'weather' } } },
+  ])('still rejects unsupported or malformed Responses content: %j', patch => {
     expect(() => convertRequest({ ...request, ...patch }, 'responses', 'openai')).toThrow(expect.objectContaining({ code: 'unsupported_conversion', status: 400 }));
   });
-  it.each([{ n: 2 }, { stop: ['END'] }, { audio: { voice: 'alloy' } }, { store: true }, { logprobs: true }, { max_tokens: 10, max_completion_tokens: 20 },
+  it.each([
     { messages: [{ role: 'user', content: [{ type: 'input_audio', input_audio: { data: 'abc', format: 'wav' } }] }] },
-    { messages: [{ role: 'user', content: 'hello', name: 'speaker' }] }])('rejects unsupported Chat semantics: %j', patch => {
+    { messages: [{ role: 'user', content: [{ type: 'text' }] }] }, { messages: [{ role: 'user' }] },
+    { messages: [{ role: 'assistant', content: 'answer', audio: { id: 'audio_1' } }] },
+    { messages: [{ role: 'assistant', content: 'answer', reasoning_content: 'private reasoning' }] },
+    { messages: [{ role: 'assistant', content: 'answer', function_call: { name: 'weather', arguments: '{}' } }] },
+    { messages: [{ role: 'tool', tool_call_id: 'call_1' }] },
+    { messages: [{ role: 'assistant', tool_calls: [{ id: 'call_1', type: 'custom', custom: { name: 'weather', input: '{}' } }] }] },
+    { messages: [{ role: 'assistant', tool_calls: [{ id: 'call_1', type: 'function', function: { name: 'weather' } }] }] },
+    { tools: [{ type: 'function', function: { name: 'weather', parameters: [] } }] },
+    { response_format: { type: 'json_schema', json_schema: { name: 'weather' } } },
+  ])('still rejects unsupported or malformed Chat content: %j', patch => {
     expect(() => convertRequest({ ...chat, ...patch }, 'openai', 'responses')).toThrow(expect.objectContaining({ code: 'unsupported_conversion', status: 400 }));
   });
 });

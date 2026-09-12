@@ -1,6 +1,6 @@
 import type { Context } from 'hono';
 import type { AppEnv, Env } from './types';
-import { jobStatus, observabilityScope, type LogCursor, type SyncRow } from './observability-store';
+import { jobStatus, observabilityScope, readLogCursor, type SyncRow } from './observability-store';
 import { CHANNEL_AVAILABILITY_WINDOW_MS, CHANNEL_AVAILABILITY_BUCKET_MS, CHANNEL_AVAILABILITY_BUCKET_COUNT, type ChannelAvailability, type ChannelAvailabilityResponse } from '../shared/observability';
 
 interface BucketRow { channel_id: string; bucket: number; requests: number; successes: number }
@@ -42,14 +42,18 @@ export async function getChannelAvailability(env: Env, now = Date.now()): Promis
   const head = jobs.results.find(row => row.job === 'logs:head');
   const repair = jobs.results.find(row => row.job === 'logs:repair');
   const history = jobs.results.find(row => row.job === 'logs:history');
-  const coverage: LogCursor = history?.cursor ? JSON.parse(history.cursor) : {};
-  const unfinished = jobs.results.some(row => row.job !== 'logs:history' && row.cursor && (JSON.parse(row.cursor) as LogCursor).window);
+  // Either a recent repair pass or a historical pass can have read this hour.
+  // Starting another background sweep must not hide a recently finished pass.
+  const scanned = [repair, history].some(row => {
+    const cursor = readLogCursor(row?.cursor);
+    return cursor.covered_from && cursor.covered_from <= window_start
+      && cursor.covered_to && Date.parse(cursor.covered_to) >= end - 10 * 60000;
+  });
   const result: ChannelAvailabilityResponse = {
     data: [...byChannel.values()], window_start, window_end, storage: 'd1', source: 'cloudflare',
     sync: jobStatus('logs:head', head),
     jobs: [jobStatus('logs:head', head), jobStatus('logs:repair', repair), jobStatus('logs:history', history)],
-    backfilling: unfinished || !repair?.last_success_at || !coverage.covered_from || coverage.covered_from > window_start
-      || !coverage.covered_to || Date.parse(coverage.covered_to) < end - 10 * 60000,
+    backfilling: !head?.last_success_at || !scanned,
   };
   return result;
 }

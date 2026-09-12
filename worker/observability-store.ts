@@ -11,8 +11,16 @@ export interface SyncRow {
   last_attempt_at: string | null; last_success_at: string | null; last_error: string | null;
 }
 export interface LogCursor {
-  window?: { start: string; end: string; page: number; previous_page?: string; kind?: 'backfill' | 'forward' | 'audit' };
-  covered_from?: string; covered_to?: string; audit_to?: string; last_audit_at?: number;
+  version: 2;
+  scan?: { page: number; started_at: string; stop_before: string };
+  // Bounds of the last finished newest-first pass, not a snapshot guarantee.
+  covered_from?: string; covered_to?: string;
+}
+export function readLogCursor(value: string | null | undefined): LogCursor {
+  const cursor = value ? JSON.parse(value) as Partial<LogCursor> : null;
+  // Old filtered-window checkpoints cannot resume against an unfiltered list.
+  // Only the checkpoint resets; previously cached logs remain available.
+  return cursor?.version === 2 ? cursor as LogCursor : { version: 2 };
 }
 // Token rotation must not discard the fallback data for the same resource.
 export const observabilityScope = (env: Env) => JSON.stringify(['v1', accountId(env), gatewayId(env)]);
@@ -55,11 +63,11 @@ export async function getObservabilityStatus(env: Env): Promise<ObservabilitySta
     env.DB.prepare('SELECT COUNT(*) AS total, MIN(created_at) AS oldest_at, MAX(created_at) AS newest_at FROM observability_logs WHERE scope = ? AND created_at >= ?').bind(scope, cutoff).first<{ total: number; oldest_at: string | null; newest_at: string | null }>(),
   ]);
   const history = rows.results.find(row => row.job === 'logs:history');
-  const cursor: LogCursor = history?.cursor ? JSON.parse(history.cursor) : {};
+  const cursor = readLogCursor(history?.cursor);
   return { settings, jobs: JOBS.map(job => jobStatus(job, rows.results.find(row => row.job === job))),
     logs: { total: counts?.total || 0, oldest_at: counts?.oldest_at || null, newest_at: counts?.newest_at || null,
       covered_from: cursor.covered_from ? (cursor.covered_from < cutoff ? cutoff : cursor.covered_from) : null,
-      covered_to: cursor.covered_to || null, backfilling: !cursor.covered_from || cursor.covered_from > cutoff || !cursor.covered_to || Date.now() - Date.parse(cursor.covered_to) > 10 * 60000 },
+      covered_to: cursor.covered_to || null, backfilling: !!cursor.scan || !cursor.covered_from || !cursor.covered_to },
   };
 }
 
