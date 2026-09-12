@@ -36,8 +36,8 @@ function Login({ onLogin }: { onLogin: () => void }) {
           <div className="pipeline-connector"><span />协议转换 · 标签鉴权</div>
           <div className="pipeline-node node-focus"><span className="node-number">02</span><div><strong>EdgeGate</strong><span>Cloudflare Workers</span></div><Logo small /></div>
           <div className="pipeline-connector"><span />经过 AI Gateway</div>
-          <div className="pipeline-node"><span className="node-number">03</span><div><strong>你的模型服务商</strong><span>OpenAI 兼容 · Anthropic</span></div><Cloud size={22} /></div>
-          <div className="protocol-strip"><code>POST /v1/chat/completions</code><code>POST /v1/messages</code></div>
+          <div className="pipeline-node"><span className="node-number">03</span><div><strong>你的模型服务商</strong><span>Chat Completions · Responses · Anthropic</span></div><Cloud size={22} /></div>
+          <div className="protocol-strip"><code>POST /v1/chat/completions</code><code>POST /v1/responses</code><code>POST /v1/messages</code></div>
         </section>
         <section className="access-form">
           <div className="access-form-heading"><span className="square-icon"><ShieldCheck size={22} /></span><span className="eyebrow">CONSOLE ACCESS</span></div>

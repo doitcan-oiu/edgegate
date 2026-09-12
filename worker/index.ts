@@ -30,6 +30,7 @@ app.post('/api/playground', c => chat(c, true));
 app.route('/api', admin);
 app.get('/v1/models', listModels);
 app.post('/v1/chat/completions', c => chat(c));
+app.post('/v1/responses', c => chat(c, false, 'responses'));
 app.post('/v1/messages', c => chat(c, false, 'anthropic'));
 app.notFound(c => c.json({ error: { message: '接口不存在', type: 'not_found', code: 'not_found' } }, 404));
 app.onError((error, c) => {

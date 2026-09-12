@@ -9,7 +9,7 @@ import { safeBaseUrl } from '../worker/lib/validation';
 import { getChannelAvailability } from '../worker/channel-availability';
 import { normalizeLog } from '../worker/cloudflare-observability';
 import type { ChannelAvailabilityResponse } from '../shared/observability';
-import type { Candidate, Channel, Env, Model, Route } from '../worker/types';
+import type { Candidate, Channel, Env, Model, Protocol, Route } from '../worker/types';
 import worker from '../worker/index';
 import { DEFAULT_GATEWAY_SETTINGS, type GatewaySettings, type UpstreamErrorTrace } from '../shared/gateway-settings';
 
@@ -109,7 +109,7 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
@@ -637,7 +637,7 @@ describe('local crypto and routing rules', () => {
   it.each(['http://api.example.com', 'https://127.0.0.1', 'https://[::1]', 'https://localhost', 'https://a.local', 'https://user:pass@api.example.com', 'https://api.example.com:8443', 'https://api.example.com?secret=x'])('rejects unsafe provider URL %s', url => { expect(() => safeBaseUrl(url)).toThrow(); });
 });
 
-async function catalog(name: string, protocol: 'openai' | 'anthropic', tags: string[], models: string[]) {
+async function catalog(name: string, protocol: Protocol, tags: string[], models: string[]) {
   const created = await admin<{ id: string }>('/channels', { name, kind: 'openai', provider_slug: name.toLowerCase(), base_url: `https://${name.toLowerCase()}.example.com`, secret: `${name.toLowerCase()}-provider-key`, protocol, tags, models });
   const local = await db.prepare('SELECT provider_id FROM channels WHERE id = ?').bind(created.id).first<{ provider_id: string }>();
   return { channelId: created.id, provider: providers.get(local!.provider_id)! };
@@ -1220,5 +1220,209 @@ describe('upstream error disclosure and administrator traces', () => {
     expect(traces[0].error_body.length).toBe(16384); expect(traces[0].truncated).toBe(1);
     await db.prepare("UPDATE upstream_error_traces SET created_at = '2000-01-01T00:00:00.000Z'").run();
     expect(await admin(`/traces/${id}`)).toEqual([]);
+  });
+});
+
+
+const responsesCompletion = { id: 'resp_test', object: 'response', created_at: 1, status: 'completed', model: 'upstream-test', error: null, incomplete_details: null,
+  output: [{ type: 'message', id: 'msg_test', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '你好，世界', annotations: [] }] }],
+  usage: { input_tokens: 7, output_tokens: 11, total_tokens: 18, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } } };
+const responses = (token: string, extra = {}) => request('/v1/responses', { key: token, body: { model: 'test-model', input: '你好', max_output_tokens: 100, store: false, ...extra } });
+const responsePairs: [Protocol, Protocol][] = [['responses', 'openai'], ['responses', 'anthropic'], ['responses', 'responses'], ['openai', 'responses'], ['anthropic', 'responses']];
+function protocolSSE(protocol: Protocol) {
+  const event = (value: Record<string, unknown>) => `event: ${value.type}\ndata: ${JSON.stringify(value)}\n\n`;
+  if (protocol === 'responses') return [
+    { type: 'response.created', response: { ...responsesCompletion, status: 'in_progress', output: [], usage: null } },
+    { type: 'response.in_progress', response: { ...responsesCompletion, status: 'in_progress', output: [], usage: null } },
+    { type: 'response.output_item.added', output_index: 0, item: { ...responsesCompletion.output[0], status: 'in_progress', content: [] } },
+    { type: 'response.content_part.added', output_index: 0, item_id: 'msg_test', content_index: 0, part: { type: 'output_text', text: '', annotations: [] } },
+    { type: 'response.output_text.delta', output_index: 0, item_id: 'msg_test', content_index: 0, delta: '你好，世界' },
+    { type: 'response.output_text.done', output_index: 0, item_id: 'msg_test', content_index: 0, text: '你好，世界' },
+    { type: 'response.content_part.done', output_index: 0, item_id: 'msg_test', content_index: 0, part: responsesCompletion.output[0].content[0] },
+    { type: 'response.output_item.done', output_index: 0, item: responsesCompletion.output[0] },
+    { type: 'response.completed', response: responsesCompletion },
+  ].map((value, sequence_number) => event({ ...value, sequence_number })).join('');
+  if (protocol === 'anthropic') return [
+    { type: 'message_start', message: { ...anthropicCompletion, content: [] } },
+    { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+    { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '你好，世界' } },
+    { type: 'content_block_stop', index: 0 },
+    { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 11 } }, { type: 'message_stop' },
+  ].map(event).join('');
+  return `data: ${JSON.stringify({ ...completion, choices: [{ index: 0, delta: { role: 'assistant', content: '你好，世界' }, finish_reason: null }] })}\n\ndata: ${JSON.stringify({ ...completion, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`;
+}
+
+describe('Responses API through the gateway', () => {
+  it.each(responsePairs)('converts JSON from %s upstream to %s client with tag and credential isolation', async (upstreamProtocol, clientProtocol) => {
+    await catalog('ResponsesTest', upstreamProtocol, ['responses-test'], ['test-model']);
+    const token = (await key({ allowed_tags: ['responses-test'] })).key;
+    upstream = () => MFResponse.json(upstreamProtocol === 'responses' ? responsesCompletion : upstreamProtocol === 'anthropic' ? anthropicCompletion : completion);
+    const result = clientProtocol === 'responses' ? await responses(token) : clientProtocol === 'anthropic' ? await messages(token) : await chat(token);
+    expect(result.status).toBe(200);
+    const json = await result.json();
+    if (clientProtocol === 'responses') expect(json).toMatchObject({ object: 'response', status: 'completed', output: [{ role: 'assistant', content: [{ type: 'output_text', text: '你好，世界' }] }], usage: { input_tokens: 7, output_tokens: 11 } });
+    else if (clientProtocol === 'anthropic') expect(json).toMatchObject({ type: 'message', content: [{ type: 'text', text: '你好，世界' }] });
+    else expect(json).toMatchObject({ object: 'chat.completion', choices: [{ message: { content: '你好，世界' } }] });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].url).toContain(`/custom-responsestest/v1/${upstreamProtocol === 'responses' ? 'responses' : upstreamProtocol === 'anthropic' ? 'messages' : 'chat/completions'}`);
+    expect(calls[0].headers['cf-aig-authorization']).toBe('Bearer cf-inference-token');
+    expect(calls[0].headers[upstreamProtocol === 'anthropic' ? 'x-api-key' : 'authorization']).toBe(upstreamProtocol === 'anthropic' ? 'responsestest-provider-key' : 'Bearer responsestest-provider-key');
+    expect(JSON.parse(calls[0].headers['cf-aig-metadata'])).toMatchObject({ client_protocol: clientProtocol, upstream_protocol: upstreamProtocol });
+    expect(calls[0].body).toHaveProperty(upstreamProtocol === 'responses' ? 'input' : 'messages');
+    expect(calls[0].body).not.toHaveProperty(upstreamProtocol === 'responses' ? 'messages' : 'input');
+    expect(JSON.stringify(calls)).not.toContain(token);
+  });
+  it.each(responsePairs)('streams %s upstream to %s client and keeps log IDs', async (upstreamProtocol, clientProtocol) => {
+    await catalog('ResponsesStream', upstreamProtocol, ['responses-stream'], ['test-model']);
+    const token = (await key({ allowed_tags: ['responses-stream'] })).key;
+    upstream = () => new MFResponse(protocolSSE(upstreamProtocol), { headers: { 'Content-Type': 'text/event-stream' } });
+    const result = clientProtocol === 'responses' ? await responses(token, { stream: true }) : clientProtocol === 'anthropic' ? await messages(token, { stream: true }) : await chat(token, { stream: true, stream_options: { include_usage: true } });
+    expect(result.status).toBe(200);
+    const output = await result.text();
+    expect(output).toContain('你好，世界'); expect(output).not.toContain('event: error'); expect(output).not.toContain('"error":{');
+    expect(output).toContain(clientProtocol === 'responses' ? 'event: response.completed' : clientProtocol === 'anthropic' ? 'event: message_stop' : 'data: [DONE]');
+    expect(result.headers.get('cf-aig-log-id')).toBe('cf-log-1'); expect(calls).toHaveLength(1);
+    if (upstreamProtocol === 'openai') expect(calls[0].body.stream_options).toEqual({ include_usage: true });
+    if (upstreamProtocol === 'responses') expect(calls[0].body).not.toHaveProperty('stream_options');
+  });
+  it('preserves native Responses fields but rejects them before calling an incompatible upstream', async () => {
+    const token = (await key()).key;
+    const unsupported = await responses(token, { previous_response_id: 'resp_private' });
+    expect(unsupported.status).toBe(400); expect(await unsupported.text()).toContain('unsupported_conversion'); expect(calls).toHaveLength(0);
+    await catalog('NativeResponses', 'responses', ['native-responses'], ['test-model']);
+    upstream = () => MFResponse.json(responsesCompletion);
+    const native = await responses((await key({ allowed_tags: ['native-responses'] })).key, { previous_response_id: 'resp_private', store: false, tools: [{ type: 'web_search' }], reasoning: { effort: 'medium' } });
+    expect(native.status).toBe(200); expect(await native.json()).toEqual(responsesCompletion);
+    expect(calls[0].body).toMatchObject({ previous_response_id: 'resp_private', store: false, tools: [{ type: 'web_search' }], reasoning: { effort: 'medium' } });
+  });
+  it('rejects ambiguous provider-owned state without attempting another channel', async () => {
+    await catalog('StateOne', 'responses', ['state'], ['test-model']);
+    await catalog('StateTwo', 'responses', ['state'], ['test-model']);
+    const token = (await key({ allowed_tags: ['state'] })).key;
+    const result = await responses(token, { previous_response_id: 'resp_private' });
+    expect(result.status).toBe(400); expect(await result.text()).toContain('unsupported_response_state'); expect(calls).toHaveLength(0);
+  });
+  it('enforces authentication, model access, validation and quota on Responses', async () => {
+    expect((await responses('invalid')).status).toBe(401);
+    const restricted = await key({ allowed_models: ['test-model'] });
+    expect((await responses(restricted.key, { model: 'denied' })).status).toBe(403);
+    expect((await responses(restricted.key, { input: 42 })).status).toBe(400);
+    expect((await responses(restricted.key, { max_output_tokens: 0 })).status).toBe(400);
+    expect(calls).toHaveLength(0);
+    const limited = await key({ daily_limit: 1 });
+    const first = await responses(limited.key); expect(first.status).toBe(200); await first.text();
+    expect((await responses(limited.key)).status).toBe(429); expect(calls).toHaveLength(1);
+  });
+  it('re-converts Responses requests on fallback without escaping the API key tags', async () => {
+    await catalog('FirstResponses', 'responses', ['retry-responses'], ['shared']);
+    const next = await catalog('NextChat', 'openai', ['retry-responses'], ['shared']);
+    await catalog('Excluded', 'responses', ['other'], ['shared']);
+    await db.prepare('UPDATE routes SET priority = 1 WHERE channel_id = ?').bind(next.channelId).run();
+    upstream = req => req.url.includes('/custom-firstresponses/') ? MFResponse.json({ error: { message: 'busy' } }, { status: 503 }) : MFResponse.json(completion);
+    const result = await responses((await key({ allowed_tags: ['retry-responses'] })).key, { model: 'shared', instructions: 'rule' });
+    expect(result.status).toBe(200); await result.text(); expect(calls).toHaveLength(2);
+    expect(calls[0].body).toMatchObject({ input: '你好', instructions: 'rule' });
+    expect(calls[1].body).not.toHaveProperty('input'); expect(JSON.stringify(calls[1].body.messages)).toContain('rule');
+    expect(calls[1].url).toContain('/custom-nextchat/'); expect(result.headers.get('X-Gateway-Attempts')).toBe('2');
+  });
+  it('hides nested Responses stream errors and records their original code and body', async () => {
+    await catalog('FailedResponses', 'responses', ['failed-responses'], ['test-model']);
+    const token = (await key({ allowed_tags: ['failed-responses'] })).key;
+    const raw = { type: 'response.failed', sequence_number: 0, response: { ...responsesCompletion, status: 'failed', error: { code: 'provider_private', message: 'sensitive upstream detail' } } };
+    upstream = () => new MFResponse(`event: response.failed\ndata: ${JSON.stringify(raw)}\n\n`, { headers: { 'Content-Type': 'text/event-stream' } });
+    const result = await responses(token, { stream: true });
+    const output = await result.text(); expect(output).toContain('event: error'); expect(output).not.toContain('sensitive upstream detail');
+    const traces = (await db.prepare('SELECT error_code, error_body FROM upstream_error_traces WHERE request_id = ?').bind(result.headers.get('X-Request-ID')).all()).results;
+    expect(traces).toHaveLength(1); expect(traces[0]).toMatchObject({ error_code: 'provider_private' }); expect(traces[0].error_body).toContain('sensitive upstream detail');
+    await runtime({ upstream_error_mode: 'custom', upstream_error_rules: [{ code: 'provider_private', message: '自定义上游繁忙' }] });
+    const custom = await responses(token, { stream: true }); expect(await custom.text()).toContain('自定义上游繁忙');
+  });
+  it('records failed Responses JSON even when the provider returns HTTP 200', async () => {
+    await catalog('FailedJson', 'responses', ['failed-json'], ['test-model']);
+    upstream = () => MFResponse.json({ ...responsesCompletion, status: 'failed', error: { code: 'provider_failure', message: 'private failure detail' } });
+    const result = await responses((await key({ allowed_tags: ['failed-json'] })).key);
+    expect(result.status).toBe(502); expect(await result.text()).not.toContain('private failure detail');
+    expect(await db.prepare('SELECT error_code, error_body FROM upstream_error_traces WHERE request_id = ?').bind(result.headers.get('X-Request-ID')).first()).toMatchObject({ error_code: 'provider_failure', error_body: expect.stringContaining('private failure detail') });
+  });
+  it('updates Responses paths, preserves custom paths, and discovers models with Bearer credentials', async () => {
+    const a = await catalog('ProtocolSwitch', 'openai', ['switch'], ['shared']);
+    const b = await admin<{ id: string }>('/channels', { name: 'CustomPath', kind: 'openai', provider_id: a.provider.id, secret: 'secret', gateway_path: 'special/invoke' });
+    await editProvider(a.provider, { protocol: 'responses' });
+    expect(await db.prepare('SELECT gateway_path FROM channels WHERE id = ?').bind(a.channelId).first()).toMatchObject({ gateway_path: 'v1/responses' });
+    expect(await db.prepare('SELECT gateway_path FROM channels WHERE id = ?').bind(b.id).first()).toMatchObject({ gateway_path: 'special/invoke' });
+    const c = await admin<{ id: string }>('/channels', { name: 'VersionedResponses', kind: 'openai', provider_slug: 'versioned-responses', base_url: 'https://versioned.example.com/v1', protocol: 'responses', secret: 'secret' });
+    expect(await db.prepare('SELECT gateway_path FROM channels WHERE id = ?').bind(c.id).first()).toMatchObject({ gateway_path: 'responses' });
+    expect(await admin('/providers/models', { base_url: 'https://versioned.example.com/v1', protocol: 'responses', secret: 'discovery-key' })).toEqual({ models: ['model-a', 'model-b'] });
+    expect(modelCalls[0].url).toBe('https://versioned.example.com/v1/models'); expect(modelCalls[0].headers.authorization).toBe('Bearer discovery-key'); expect(modelCalls[0].headers['anthropic-version']).toBeUndefined();
+  });
+});
+
+
+describe('custom application models during route creation', () => {
+  it('creates a new public ID and its manual route in the selected tag, forwarding the original upstream ID', async () => {
+    const a = await catalog('CustomIdA', 'openai', ['AA'], []);
+    await catalog('CustomIdB', 'openai', ['BB'], []);
+    const created = await admin<{ id: string; model_id: string; model_created: boolean }>('/routes?tag=AA', {
+      create_model: true, model_id: ' glm-5.3 ', channel_id: a.channelId, upstream_model: 'cline-pass/glm-5.3', weight: 3,
+    });
+    expect(created).toMatchObject({ model_id: 'glm-5.3', model_created: true });
+    expect(await db.prepare('SELECT * FROM routes WHERE id = ?').bind(created.id).first()).toMatchObject({ model_id: 'glm-5.3', upstream_model: 'cline-pass/glm-5.3', managed_by_provider: 0, weight: 3 });
+    expect(await admin('/models?tag=AA')).toMatchObject([{ id: 'glm-5.3', routes: [{ id: created.id }] }]);
+    expect(await admin('/models?tag=BB')).toEqual([]);
+    const aa = (await key({ allowed_tags: ['AA'] })).key, bb = (await key({ allowed_tags: ['BB'] })).key;
+    expect(await visibleModels(aa)).toEqual(['glm-5.3']); expect(await visibleModels(bb)).toEqual([]);
+    const result = await chat(aa, { model: 'glm-5.3' }); expect(result.status).toBe(200); await result.text();
+    expect(calls).toHaveLength(1); expect(calls[0].body.model).toBe('cline-pass/glm-5.3');
+    expect(calls[0].url).toContain('/custom-customida/');
+    expect((await chat(bb, { model: 'glm-5.3' })).status).toBe(403);
+    const restricted = (await key({ allowed_tags: ['AA'], allowed_models: ['test-model'] })).key;
+    expect((await chat(restricted, { model: 'glm-5.3' })).status).toBe(403); expect(calls).toHaveLength(1);
+    await editProvider(a.provider, { models: ['another-model'] });
+    expect(await db.prepare('SELECT id FROM routes WHERE id = ?').bind(created.id).first()).toEqual({ id: created.id });
+  });
+  it('reuses existing global models without changing their state, description or other routes', async () => {
+    const a = await catalog('ReuseModel', 'openai', ['AA'], []);
+    await admin('/models/test-model', { description: 'Do not overwrite', enabled: false }, 'PUT');
+    const original = (await db.prepare("SELECT * FROM routes WHERE model_id = 'test-model'").all()).results;
+    const created = await admin<{ model_created: boolean }>('/routes?tag=AA', { create_model: true, model_id: 'test-model', channel_id: a.channelId, upstream_model: 'custom-upstream' });
+    expect(created.model_created).toBe(false);
+    expect(await db.prepare("SELECT description, enabled FROM models WHERE id = 'test-model'").first()).toEqual({ description: 'Do not overwrite', enabled: 0 });
+    for (const old of original) expect(await db.prepare('SELECT * FROM routes WHERE id = ?').bind(old.id).first()).toEqual(old);
+  });
+  it('creates the first model in an empty registry under the untagged scope', async () => {
+    await db.prepare('DELETE FROM models').run();
+    const channel = await db.prepare("SELECT id FROM channels WHERE name = 'Primary'").first<{ id: string }>();
+    await admin('/routes?untagged=1', { create_model: true, model_id: 'first-model', channel_id: channel!.id, upstream_model: 'provider-first' });
+    expect(await admin('/models?untagged=1')).toMatchObject([{ id: 'first-model', routes: [{ upstream_model: 'provider-first' }] }]);
+  });
+  it('rejects invalid IDs, missing opt-in, invalid opt-in and out-of-scope channels without creating models', async () => {
+    const a = await catalog('ValidateCustom', 'openai', ['AA'], []);
+    const input = { model_id: 'must-not-exist', channel_id: a.channelId, upstream_model: 'upstream' };
+    for (const create_model of [undefined, false, 'true', 1, null]) expect((await request('/api/routes?tag=AA', { admin: true, body: { ...input, create_model } })).status).toBe(400);
+    for (const model_id of ['', 'bad name', 'x'.repeat(161)]) expect((await request('/api/routes?tag=AA', { admin: true, body: { ...input, create_model: true, model_id } })).status).toBe(400);
+    for (const suffix of ['?tag=BB', '?tag=deleted', '?untagged=1']) expect((await request(`/api/routes${suffix}`, { admin: true, body: { ...input, create_model: true } })).status).toBe(400);
+    expect((await request('/api/routes', { admin: true, body: { ...input, create_model: true, channel_id: 'missing-channel' } })).status).toBe(400);
+    expect((await request('/api/routes?tag=AA', { body: { ...input, create_model: true } })).status).toBe(401);
+    expect(await db.prepare("SELECT id FROM models WHERE id = 'must-not-exist'").first()).toBeNull();
+    expect(await db.prepare('SELECT id FROM routes WHERE channel_id = ?').bind(a.channelId).first()).toBeNull();
+  });
+  it('rolls back the new model if inserting its route fails', async () => {
+    const a = await catalog('AtomicModel', 'openai', ['AA'], []);
+    await db.prepare("CREATE TRIGGER fail_custom_route BEFORE INSERT ON routes WHEN NEW.model_id = 'rollback-model' BEGIN SELECT RAISE(ABORT, 'injected route failure'); END").run();
+    try {
+      const result = await request('/api/routes?tag=AA', { admin: true, body: { create_model: true, model_id: 'rollback-model', channel_id: a.channelId, upstream_model: 'upstream' } });
+      expect(result.status).toBe(500); await result.text();
+      expect(await db.prepare("SELECT id FROM models WHERE id = 'rollback-model'").first()).toBeNull();
+      expect(await db.prepare("SELECT id FROM routes WHERE model_id = 'rollback-model'").first()).toBeNull();
+    } finally { await db.prepare('DROP TRIGGER fail_custom_route').run(); }
+  });
+  it('allows concurrent model reuse while rejecting duplicate routes', async () => {
+    const a = await catalog('ConcurrentModel', 'openai', ['AA'], []);
+    const input = { create_model: true, model_id: 'shared-new-model', channel_id: a.channelId, upstream_model: 'upstream' };
+    const results = await Promise.all([request('/api/routes?tag=AA', { admin: true, body: input }), request('/api/routes?tag=AA', { admin: true, body: input })]);
+    expect(results.map(result => result.status).sort()).toEqual([201, 409]);
+    await Promise.all(results.map(result => result.text()));
+    expect(await db.prepare("SELECT COUNT(*) AS n FROM models WHERE id = 'shared-new-model'").first()).toEqual({ n: 1 });
+    expect(await db.prepare("SELECT COUNT(*) AS n FROM routes WHERE model_id = 'shared-new-model'").first()).toEqual({ n: 1 });
   });
 });

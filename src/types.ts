@@ -1,11 +1,13 @@
 import type { SyncJobStatus } from '../shared/observability';
+import type { Protocol } from '../shared/protocols';
+export type { Protocol } from '../shared/protocols';
 export interface Channel {
-  protocol: 'openai' | 'anthropic'; tags: string[]; models: string[];
+  protocol: Protocol; tags: string[]; models: string[];
   id: string; name: string; kind: 'cloudflare' | 'ai-gateway' | 'openai'; base_url: string;
   enabled: number; timeout_ms: number; has_secret: boolean; configured: boolean; created_at: string; auto_create_routes: number;
   provider_id: string | null; provider_slug: string | null; gateway_path: string; byok_alias: string;
 }
-export interface ProviderProfile { protocol: 'openai' | 'anthropic'; tags: string[]; models: string[] }
+export interface ProviderProfile { protocol: Protocol; tags: string[]; models: string[] }
 export interface CustomProvider extends ProviderProfile { id: string; name: string; slug: string; base_url: string; enable?: boolean; description?: string }
 export interface ProviderPage { data: CustomProvider[]; page: number; total: number | null; has_more: boolean }
 export interface Route {

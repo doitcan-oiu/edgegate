@@ -6,7 +6,8 @@ export const nameSchema = z.string().trim().min(1).max(80);
 export const modelId = z.string().trim().min(1).max(160).regex(/^[a-zA-Z0-9@][a-zA-Z0-9._:/-]*$/, '模型 ID 只能包含字母、数字、点、下划线、斜线和短横线');
 export const tagsSchema = z.array(z.string().trim().min(1).max(40).regex(/^[\p{L}\p{N}_.\/-]+$/u, '标签可包含中英文、数字、点、下划线、斜线和短横线')).max(32).transform(tags => [...new Set(tags)].sort());
 export const MAX_PROVIDER_MODELS = 1000;
-export const profileSchema = z.object({ protocol: z.enum(['openai', 'anthropic']).default('openai'), tags: tagsSchema.default([]), models: z.array(modelId).max(MAX_PROVIDER_MODELS).default([]).transform(models => [...new Set(models)]) });
+export const protocolSchema = z.enum(['openai', 'anthropic', 'responses']);
+export const profileSchema = z.object({ protocol: protocolSchema.default('openai'), tags: tagsSchema.default([]), models: z.array(modelId).max(MAX_PROVIDER_MODELS).default([]).transform(models => [...new Set(models)]) });
 
 export function safeBaseUrl(value: string) {
   let url: URL;
@@ -34,6 +35,8 @@ export const channelSchema = z.object({
   provider_slug: z.string().trim().max(64).regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/).optional(),
   gateway_path: z.string().trim().min(1).max(300).regex(/^[a-zA-Z0-9_/-]+$/, '请求路径只能包含字母、数字、下划线、短横线和斜线').optional(),
   byok_alias: z.string().trim().max(100).regex(/^[a-zA-Z0-9_-]*$/).default(''),
+}).refine(data => data.kind === 'openai' || data.protocol !== 'responses', {
+  path: ['protocol'], message: 'OpenAI Responses 仅适用于自定义服务商渠道',
 });
 export const channelStateSchema = z.object({ enabled: z.boolean() }).strict();
 export const providerSchema = z.object({
@@ -51,6 +54,7 @@ export const routeSchema = z.object({
   input_price: z.number().min(0).max(100000).nullable().default(null),
   output_price: z.number().min(0).max(100000).nullable().default(null), enabled: z.boolean().default(true),
 });
+export const routeCreateSchema = routeSchema.extend({ create_model: z.boolean().default(false) });
 export const keySchema = z.object({
   allowed_tags: tagsSchema.default([]),
   name: nameSchema, allowed_models: z.array(modelId).max(100).default([]),
@@ -72,6 +76,17 @@ export const chatSchema = z.object({
   n: z.number().int().min(1).max(8).optional(),
 }).passthrough();
 export type ChatInput = z.infer<typeof chatSchema>;
+export const responsesSchema = z.object({
+  model: modelId,
+  input: z.union([z.string(), z.array(z.record(z.string(), z.unknown()))]).optional(),
+  instructions: z.string().nullable().optional(),
+  previous_response_id: z.string().min(1).nullable().optional(),
+  stream: z.boolean().default(false),
+  max_output_tokens: z.number().int().positive().optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  top_p: z.number().min(0).max(1).optional(),
+}).passthrough();
+export type ResponsesInput = z.infer<typeof responsesSchema>;
 export const messagesSchema = z.object({
   model: modelId,
   max_tokens: z.number().int().positive(),

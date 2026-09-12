@@ -111,7 +111,7 @@ curl https://YOUR-WORKER.workers.dev/v1/chat/completions \
   -d '{"model":"smart-chat","messages":[{"role":"user","content":"你好"}],"stream":true}'
 ```
 
-支持 `GET /v1/models`、`POST /v1/chat/completions` 和 `POST /v1/messages`，包括 JSON / SSE、文本、图片和工具调用。客户端使用 OpenAI SDK 时把 Base URL 设置为 `https://YOUR-WORKER.workers.dev/v1`。
+支持 `GET /v1/models`、`POST /v1/chat/completions`、`POST /v1/responses` 和 `POST /v1/messages`，包括 JSON / SSE、文本、图片和工具调用。客户端使用 OpenAI SDK 时把 Base URL 设置为 `https://YOUR-WORKER.workers.dev/v1`。
 
 ### 其他保留的渠道
 
@@ -130,10 +130,13 @@ curl https://YOUR-WORKER.workers.dev/v1/chat/completions \
 | `/v1/chat/completions` | Anthropic | OpenAI 请求 → Messages；响应 / SSE → OpenAI |
 | `/v1/messages` | Anthropic | 同协议透传，转发版本与 Beta 请求头 |
 | `/v1/messages` | OpenAI | Messages 请求 → Chat Completions；响应 / SSE → Anthropic |
+| `/v1/responses` | OpenAI Responses | 同协议透传 |
+| `/v1/responses` | OpenAI / Anthropic | Responses 请求 → Chat Completions / Messages；响应 / SSE → Responses |
+| `/v1/chat/completions` / `/v1/messages` | OpenAI Responses | 客户端请求 → Responses；响应 / SSE → 客户端协议 |
 
-Anthropic 服务商常用路径是 `v1/messages`（Base URL 已包含 `/v1` 时填 `messages`），OpenAI 为 `v1/chat/completions`。在渠道或服务商表单中切换协议会自动调整关联渠道的这些标准路径，特殊自定义路径需在渠道中手动调整。
+Anthropic 服务商常用路径是 `v1/messages`（Base URL 已包含 `/v1` 时填 `messages`），OpenAI Chat Completions 为 `v1/chat/completions`，OpenAI Responses 为 `v1/responses`（Base URL 已包含 `/v1` 时填 `responses`）。在渠道或服务商表单中切换协议会自动调整关联渠道的这些标准路径，特殊自定义路径需在渠道中手动调整。
 
-两种端点均接受应用 `Authorization: Bearer eg_…` 或 `x-api-key: eg_…`。客户端的凭据不会转发给供应商，Cloudflare 认证和供应商认证由服务端独立设置。Anthropic 请求示例：
+三种推理端点均接受应用 `Authorization: Bearer eg_…` 或 `x-api-key: eg_…`。客户端的凭据不会转发给供应商，Cloudflare 认证和供应商认证由服务端独立设置。Anthropic 请求示例：
 
 ```bash
 curl https://YOUR-WORKER.workers.dev/v1/messages \
@@ -147,12 +150,29 @@ curl https://YOUR-WORKER.workers.dev/v1/messages \
 
 协议存在差异，当前边界如下：
 
-- 同协议请求保留原协议扩展。跨协议不支持的参数（如扩展 thinking、提示缓存控制、服务端工具、音频、JSON response_format、多候选 `n > 1`、Anthropic `top_k`）返回明确的 `unsupported_conversion`。存在同协议可用路由时可跳过无法转换的候选。
+- 同协议请求保留原协议扩展。跨协议不支持的参数（如扩展 thinking、提示缓存控制、服务端工具、音频、Anthropic 不支持的 JSON response_format、多候选 `n > 1`、Anthropic `top_k`）返回明确的 `unsupported_conversion`。存在同协议可用路由时可跳过无法转换的候选。
 - OpenAI → Anthropic 未指定输出长度时使用 `max_tokens=4096`；Anthropic 的温度范围要求为 0–1，程序不悄悄截断超出范围的温度。实际模型仍可能有更严格要求。
 - Anthropic 客户端调用 OpenAI 服务商时，流式请求会向上游请求 `include_usage`。Anthropic 的初始流式计数从 0 开始，结束事件更新为上游报告值；若上游缺少必要用量、缺少结束事件或出现无法表示的内容，转换会报错。不会自行补算用量或账单；后台仍会同步 Cloudflare 实际报告的记录。
-- 供应商认证按上游协议选择：OpenAI 使用 Bearer，Anthropic 使用 `x-api-key`。故障转移时按候选渠道重新选择密钥和认证头。其他私有认证方式尚不支持；已有 BYOK 模式使用 Cloudflare 对应的凭据配置。
+- 供应商认证按上游协议选择：OpenAI Chat Completions / Responses 使用 Bearer，Anthropic 使用 `x-api-key`。故障转移时按候选渠道重新选择密钥和认证头。其他私有认证方式尚不支持；已有 BYOK 模式使用 Cloudflare 对应的凭据配置。
+
+Responses 的函数工具跨协议转换时，应显式填写 `strict: true` 或 `strict: false`；省略且无法确认等价严格语义的 schema 会被拒绝。转换到 Anthropic 时使用 `strict: false`，避免将 OpenAI 严格 schema 的保证静默降级。非空 reasoning、引用注释及加密推理内容需使用原生 Responses 渠道。
+
+Responses 调用示例（使用应用 API Key，模型填写本程序的公开模型 ID）：
+
+```bash
+curl https://YOUR-WORKER.workers.dev/v1/responses \
+  -H "Authorization: Bearer $EDGEGATE_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"smart-chat","input":"你好","max_output_tokens":1024,"store":false,"stream":true}'
+```
+
+Responses 与 Chat Completions 之间会转换 `input` / `messages`、`instructions`、`max_output_tokens`、函数工具与调用结果、`text.format` / `response_format` 和 usage；Anthropic 通过 Chat Completions 作为中间格式转换。Responses SSE 使用 `response.created`、`response.output_text.delta`、函数参数事件和 `response.completed` / `response.incomplete`，不会把 Chat Completions 的 `[DONE]` 冒充 Responses 终止事件。原生流里的 `response.failed` 和嵌套上游错误也受「上游错误展示」配置控制，管理员追踪保留原始错误。
+
+本次实现 `POST /v1/responses`，不提供 Responses 的查询、删除、取消、压缩端点或 WebSocket。跨协议转换要求客户端通过 `input` 传完整上下文；`previous_response_id`、`conversation`、内建工具及其他无法表示的扩展仅能交给原生 Responses 上游。引用上游会话时，当前模型授权范围内必须只有一个可用 Responses 渠道，并保持渠道和凭据不变；程序不会跨渠道续接或自动管理上游会话。`background` / 存储等原生能力的后续操作需要在对应上游完成。协议字段和流事件依据 [OpenAI Responses 迁移指南](https://developers.openai.com/api/docs/guides/migrate-to-responses) 与 [SSE 指南](https://developers.openai.com/api/docs/guides/streaming-responses)。
 
 ## 服务商标签与模型并集
+
+「添加模型路由」中的应用模型 ID 支持输入新 ID 或选择已有模型。例如应用 ID 填 `glm-5.3`，上游 ID 填 `cline-pass/glm-5.3`，即可通过该标签下的路由使用自定义调用名。保存时以同一事务创建新模型和路由；已有模型只添加路由，不修改全局状态或描述。通过此入口创建的路由为手动路由，不会被服务商模型清单同步覆盖。
 
 创建服务商或创建新服务商渠道时，可以填写协议、标签和模型清单。已有服务商可直接在渠道表单中编辑，也可通过「Cloudflare 账户资源」入口编辑。它们是 EdgeGate 的业务配置，保存在 D1，并关联 Cloudflare provider ID；不会伪装成 Cloudflare 原生标签参数。
 
@@ -232,7 +252,7 @@ npm run db:migrate          # 本地
 npm run db:migrate:remote
 ```
 
-`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。`0005_channel_auto_routes.sql` 新增渠道自动路由开关，现有渠道默认开启。`0006_long_channel_timeout.sql` 将渠道超时上限放宽到 3600 秒，保留现有渠道、密钥和路由。`0007_observability_cache.sql` 新增日志元数据、统计快照、同步状态和保留期配置表，不修改历史业务数据。Cron 每分钟调度同步并清理过期缓存，原配额与 7 天错误追踪的清理仍在每天 UTC 03:15 执行。
+`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。`0005_channel_auto_routes.sql` 新增渠道自动路由开关，现有渠道默认开启。`0006_long_channel_timeout.sql` 将渠道超时上限放宽到 3600 秒，保留现有渠道、密钥和路由。`0007_observability_cache.sql` 新增日志元数据、统计快照、同步状态和保留期配置表，不修改历史业务数据。`0008_responses_protocol.sql` 扩展服务商协议约束以支持 Responses，并保留现有服务商、标签和模型清单；升级时需应用此迁移。Cron 每分钟调度同步并清理过期缓存，原配额与 7 天错误追踪的清理仍在每天 UTC 03:15 执行。
 
 旧「OpenAI 兼容」直连渠道会显示待配置，**不会继续直连供应商**。编辑渠道，将其关联到 Cloudflare 服务商，并确认请求路径。仅当完整上游 URL 与旧地址完全一致时，才会保留原有加密 Key；目的地不一致需重新输入密钥或提供已有 BYOK 别名。关联后推理经过 AI Gateway，密钥继续加密保存在 D1。
 

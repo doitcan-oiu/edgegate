@@ -13,7 +13,7 @@ export function upstreamFailure(status: number | null, body: string, code = stat
   let message = body, providerCode: string | undefined;
   try {
     const parsed = JSON.parse(body);
-    const error = parsed?.error ?? parsed?.errors?.[0] ?? parsed;
+    const error = parsed?.error ?? parsed?.response?.error ?? parsed?.errors?.[0] ?? parsed;
     message = typeof error === 'string' ? error : typeof error?.message === 'string' ? error.message : body;
     const candidateCode = error?.code ?? error?.type ?? parsed?.code;
     if (typeof candidateCode === 'string' || typeof candidateCode === 'number') providerCode = String(candidateCode).slice(0, 100);

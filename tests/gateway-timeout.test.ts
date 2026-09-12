@@ -24,7 +24,7 @@ function candidate(timeout: number, protocol: Protocol = 'openai', id = 'primary
     channel: { id, name: id, kind: 'openai', base_url: 'https://example.com', secret_encrypted: null, enabled: 1, timeout_ms: timeout, auto_create_routes: 1, created_at: '', provider_id: 'provider', provider_slug: 'provider', gateway_path: 'v1/chat/completions', byok_alias: 'default', protocol } };
 }
 function request(protocol: Protocol = 'openai', stream = true, signal?: AbortSignal) {
-  return app.request(`/${protocol}`, { method: 'POST', body: JSON.stringify({ model: 'model', messages: [{ role: 'user', content: 'Hello' }], max_tokens: 1024, stream }), signal }, {} as Env);
+  return app.request(`/${protocol}`, { method: 'POST', body: JSON.stringify(protocol === 'responses' ? { model: 'model', input: 'Hello', max_output_tokens: 1024, stream } : { model: 'model', messages: [{ role: 'user', content: 'Hello' }], max_tokens: 1024, stream }), signal }, {} as Env);
 }
 function frames(protocol: Protocol) {
   const data = (value: unknown) => `data: ${JSON.stringify(value)}\n\n`;
@@ -33,6 +33,21 @@ function frames(protocol: Protocol) {
     end: data({ id: 'completion', model: 'upstream', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 } }) + 'data: [DONE]\n\n',
   };
   const event = (type: string, value: object) => `event: ${type}\n${data({ type, ...value })}`;
+  if (protocol === 'responses') {
+    const part = { type: 'output_text', text: 'hello', annotations: [] };
+    const item = { id: 'msg_test', type: 'message', role: 'assistant', status: 'completed', content: [part] };
+    const response = { id: 'resp_test', object: 'response', created_at: 1, model: 'upstream', status: 'completed', output: [item], error: null, usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } };
+    return {
+      start: event('response.created', { sequence_number: 0, response: { ...response, status: 'in_progress', output: [], usage: null } })
+        + event('response.output_item.added', { sequence_number: 1, output_index: 0, item: { ...item, status: 'in_progress', content: [] } })
+        + event('response.content_part.added', { sequence_number: 2, output_index: 0, item_id: item.id, content_index: 0, part: { ...part, text: '' } })
+        + event('response.output_text.delta', { sequence_number: 3, output_index: 0, item_id: item.id, content_index: 0, delta: 'hello' }),
+      end: event('response.output_text.done', { sequence_number: 4, output_index: 0, item_id: item.id, content_index: 0, text: 'hello' })
+        + event('response.content_part.done', { sequence_number: 5, output_index: 0, item_id: item.id, content_index: 0, part })
+        + event('response.output_item.done', { sequence_number: 6, output_index: 0, item })
+        + event('response.completed', { sequence_number: 7, response }),
+    };
+  }
   return {
     start: event('message_start', { message: { id: 'message', model: 'upstream', usage: { input_tokens: 1, output_tokens: 0 } } })
       + event('content_block_start', { index: 0, content_block: { type: 'text', text: '' } })
@@ -61,7 +76,7 @@ beforeEach(() => {
 afterEach(() => { vi.clearAllTimers(); vi.useRealTimers(); vi.resetAllMocks(); });
 
 describe('long upstream request deadlines', () => {
-  it.each<[Protocol, Protocol]>([['openai', 'openai'], ['anthropic', 'anthropic'], ['openai', 'anthropic'], ['anthropic', 'openai']])('streams past 10 minutes from %s to %s without the old 180-second cap', async (upstreamProtocol, clientProtocol) => {
+  it.each<[Protocol, Protocol]>([['openai', 'openai'], ['anthropic', 'anthropic'], ['openai', 'anthropic'], ['anthropic', 'openai'], ['responses', 'responses'], ['responses', 'openai'], ['responses', 'anthropic'], ['openai', 'responses'], ['anthropic', 'responses']])('streams past 10 minutes from %s to %s without the old 180-second cap', async (upstreamProtocol, clientProtocol) => {
     vi.mocked(getCandidates).mockResolvedValue([candidate(1200000, upstreamProtocol)]);
     const upstream = streamingUpstream();
     const response = await request(clientProtocol), reading = response.text();
@@ -70,12 +85,12 @@ describe('long upstream request deadlines', () => {
     expect(upstream.signal.aborted).toBe(false);
     upstream.source.enqueue(encoder.encode(frames(upstreamProtocol).end)); upstream.source.close();
     const text = await reading;
-    expect(text).toContain('hello'); expect(text).not.toContain('error');
+    expect(text).toContain('hello'); expect(text).not.toContain('event: error'); expect(text).not.toContain('"error":{');
     expect(requestUpstream).toHaveBeenCalledTimes(1);
     expect(recordUpstreamFailure).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
   });
-  it.each<Protocol>(['openai', 'anthropic'])('enforces the full SSE deadline and records a timeout without replaying %s output', async protocol => {
+  it.each<Protocol>(['openai', 'anthropic', 'responses'])('enforces the full SSE deadline and records a timeout without replaying %s output', async protocol => {
     vi.mocked(getCandidates).mockResolvedValue([candidate(1200000, protocol), candidate(1200000, protocol, 'fallback', 1)]);
     const upstream = streamingUpstream();
     const response = await request(protocol), reading = response.text();

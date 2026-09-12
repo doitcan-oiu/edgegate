@@ -65,7 +65,7 @@ export function ProviderFields({ value, onChange, discovery, onLoadingChange, re
     }
   }
   return <>
-    <Field label="服务商协议" hint="按供应商实际接口选择；网关自动转换客户端请求，并使用相应协议的认证方式。"><Select disabled={readOnly} value={value.protocol} onChange={protocol => onChange({ ...value, protocol: protocol as ProviderProfile['protocol'] })}><option value="openai">OpenAI 兼容 · Chat Completions</option><option value="anthropic">Anthropic · Messages</option></Select></Field>
+    <Field label="服务商协议" hint="按供应商实际接口选择；网关自动转换客户端请求，并使用相应协议的认证方式。"><Select disabled={readOnly} value={value.protocol} onChange={protocol => onChange({ ...value, protocol: protocol as ProviderProfile['protocol'] })}><option value="openai">OpenAI 兼容 · Chat Completions</option><option value="responses">OpenAI Responses</option><option value="anthropic">Anthropic · Messages</option></Select></Field>
     <Field label="服务商标签" hint="用逗号分隔，例如 production, claude。API Key 可按这些标签限制访问。"><Input disabled={readOnly} value={tags} onChange={e => { setTags(e.target.value); onChange({ ...value, tags: split(e.target.value) }); }} placeholder="production, claude" /></Field>
     <Field label="服务商模型清单" hint="输入模型 ID 后按回车添加，也可粘贴多行或用逗号分隔。最多 1000 个，自动去重。">
       <div className="model-discovery-toolbar"><Button type="button" variant="secondary" disabled={readOnly || loading || !discovery.base_url.trim()} onClick={fetchModels}>{loading && <LoaderCircle size={15} strokeWidth={1.5} className="animate-spin" />}{loading ? '正在获取…' : '从上游获取'}</Button><span className="muted">GET /v1/models</span></div>

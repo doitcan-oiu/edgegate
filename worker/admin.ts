@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import type { AppEnv, Model, Route } from './types';
 import { ApiError, invalid } from './lib/errors';
 import { encryptionConfigured, randomToken, sha256 } from './lib/crypto';
-import { modelSchema, routeSchema, keySchema } from './lib/validation';
+import { modelSchema, routeSchema, routeCreateSchema, keySchema } from './lib/validation';
 import { channels } from './channels';
 import { logs, logDetail, stats } from './observability';
 import { channelAvailability } from './channel-availability';
@@ -59,26 +59,40 @@ admin.delete('/models/:id', async c => {
   await c.env.DB.prepare('DELETE FROM models WHERE id = ?').bind(c.req.param('id')).run();
   return c.json({ ok: true });
 });
-async function validateRoute(data: ReturnType<typeof routeSchema.parse>, db: D1Database, excludeId = '') {
+async function validateRoute(data: ReturnType<typeof routeSchema.parse>, db: D1Database, excludeId = '', allowNewModel = false) {
   const [model, channel, duplicate] = await Promise.all([
     db.prepare('SELECT id FROM models WHERE id = ?').bind(data.model_id).first(),
     db.prepare('SELECT id FROM channels WHERE id = ?').bind(data.channel_id).first(),
     db.prepare('SELECT id FROM routes WHERE model_id = ? AND channel_id = ? AND upstream_model = ? AND id != ?').bind(data.model_id, data.channel_id, data.upstream_model, excludeId).first(),
   ]);
-  if (!model || !channel) throw invalid('请选择有效的模型和渠道');
+  if ((!model && !allowNewModel) || !channel) throw invalid('请选择有效的模型和渠道');
   if (duplicate) throw new ApiError(409, 'conflict', '该路由已存在');
 }
 admin.post('/routes', async c => {
-  const data = routeSchema.parse(await c.req.json());
+  const data = routeCreateSchema.parse(await c.req.json());
   await checkRouteScope(c, data.channel_id);
-  await validateRoute(data, c.env.DB);
+  await validateRoute(data, c.env.DB, '', data.create_model);
   const id = `rt_${randomToken(12)}`;
   const target = scopeCondition(readRouteScope(c), 'id');
-  const result = await c.env.DB.prepare(`INSERT INTO routes (id, model_id, channel_id, upstream_model, priority, weight, input_price, output_price, enabled)
-    SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})`)
-    .bind(id, data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, data.channel_id, ...target.values).run();
-  if (!result.meta.changes) throw new ApiError(409, 'route_scope_changed', '渠道范围已变化，请刷新后重试');
-  return c.json({ id }, 201);
+  // One transaction creates the optional model and its scoped route together.
+  // Reusing an ID must preserve its global description and enabled state.
+  let results: D1Result[];
+  try {
+    results = await c.env.DB.batch([
+      c.env.DB.prepare(`INSERT INTO models (id) SELECT ? WHERE ? AND EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})
+        ON CONFLICT(id) DO NOTHING`).bind(data.model_id, +data.create_model, data.channel_id, ...target.values),
+      c.env.DB.prepare(`INSERT INTO routes (id, model_id, channel_id, upstream_model, priority, weight, input_price, output_price, enabled)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})`)
+        .bind(id, data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, data.channel_id, ...target.values),
+    ]);
+  } catch (error) {
+    if (error instanceof Error && error.message.includes('UNIQUE constraint failed: routes.model_id, routes.channel_id, routes.upstream_model')) {
+      throw new ApiError(409, 'conflict', '该路由已存在');
+    }
+    throw error;
+  }
+  if (!results[1].meta.changes) throw new ApiError(409, 'route_scope_changed', '渠道范围已变化，请刷新后重试');
+  return c.json({ id, model_id: data.model_id, model_created: !!results[0].meta.changes }, 201);
 });
 admin.put('/routes/:id', async c => {
   const data = routeSchema.parse(await c.req.json()), id = c.req.param('id');

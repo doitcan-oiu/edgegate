@@ -1,6 +1,7 @@
 import type { Protocol } from '../types';
 import { anthropicStop, anthropicUsage, badResponse, openaiStop, openaiUsage, type ObjectValue } from './convert';
 import { streamErrorEvent, UpstreamStreamError, type StreamErrorHandler } from './error-stream';
+import { chatToResponses, responsesToChat } from './responses-stream';
 
 const encoder = new TextEncoder();
 const maxEvent = 1024 * 1024;
@@ -26,13 +27,13 @@ async function* frames(body: ReadableStream<Uint8Array>) {
     }
   } finally { await reader.cancel().catch(() => {}); reader.releaseLock(); }
 }
-async function* anthropicToOpenAI(body: ReadableStream<Uint8Array>, includeUsage: boolean) {
+async function* anthropicToOpenAI(source: AsyncIterable<string>, includeUsage: boolean) {
   let id = '', model = '', reason: string | undefined, usage: ObjectValue = {}, started = false;
   const blocks = new Map<number, { type: string; toolIndex?: number; hasArguments?: boolean; closed?: boolean }>();
   let tools = 0;
   const created = Math.floor(Date.now() / 1000);
   const chunk = (delta: ObjectValue, finish: string | null = null) => data({ id, model, created, object: 'chat.completion.chunk', choices: [{ index: 0, delta, finish_reason: finish, logprobs: null }] });
-  for await (const payload of frames(body)) {
+  for await (const payload of source) {
     const value = JSON.parse(payload) as ObjectValue;
     if (value.type === 'error') throw new UpstreamStreamError(payload);
     if (value.type === 'ping') continue;
@@ -76,12 +77,12 @@ async function* anthropicToOpenAI(body: ReadableStream<Uint8Array>, includeUsage
   }
   throw badResponse();
 }
-async function* openaiToAnthropic(body: ReadableStream<Uint8Array>) {
+async function* openaiToAnthropic(source: AsyncIterable<string>) {
   let started = false, nextIndex = 0, textIndex: number | undefined, reason: string | undefined, usage: ObjectValue | undefined;
   const open = new Set<number>();
   const tools = new Map<number, { index: number; id: string; name: string; pending: string; started: boolean }>();
   const stopBlocks = function* () { for (const index of [...open].sort((a, b) => a - b)) yield event('content_block_stop', { index }); open.clear(); };
-  for await (const payload of frames(body)) {
+  for await (const payload of source) {
     if (payload === '[DONE]') {
       if (!started || !reason || !usage) throw badResponse();
       for (const tool of tools.values()) if (!tool.started) {
@@ -141,8 +142,17 @@ async function* openaiToAnthropic(body: ReadableStream<Uint8Array>) {
   }
   throw badResponse();
 }
+// Bridge generated complete SSE events without collecting the upstream response.
+async function* payloads(source: AsyncIterable<string>) {
+  for await (const value of source) yield value.split('\n').filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n');
+}
 export function convertStream(body: ReadableStream<Uint8Array>, from: Protocol, to: Protocol, includeUsage: boolean, finish: () => void, onError?: StreamErrorHandler, requestId = '') {
-  const iterator = (from === 'anthropic' ? anthropicToOpenAI(body, includeUsage) : openaiToAnthropic(body))[Symbol.asyncIterator]();
+  let source: AsyncIterable<string> = frames(body);
+  if (from === 'anthropic') source = payloads(anthropicToOpenAI(source, to === 'openai' ? includeUsage : true));
+  if (from === 'responses') source = payloads(responsesToChat(source, to === 'openai' ? includeUsage : true));
+  let sequence = 0;
+  const events = to === 'anthropic' ? openaiToAnthropic(source) : to === 'responses' ? chatToResponses(source, next => { sequence = next; }) : (async function* () { for await (const payload of source) yield `data: ${payload}\n\n`; })();
+  const iterator = events[Symbol.asyncIterator]();
   return new ReadableStream<Uint8Array>({
     async pull(controller) {
       try {
@@ -151,11 +161,10 @@ export function convertStream(body: ReadableStream<Uint8Array>, from: Protocol, 
       } catch (caught) {
         finish(); await iterator.return?.();
         if (onError) {
-          controller.enqueue(encoder.encode(streamErrorEvent(await onError(caught instanceof UpstreamStreamError ? caught.raw : ''), to, requestId)));
+          controller.enqueue(encoder.encode(streamErrorEvent(await onError(caught instanceof UpstreamStreamError ? caught.raw : ''), to, requestId, sequence)));
           controller.close(); return;
         }
-        const error = { type: 'api_error', message: '上游流中断或包含无法转换的事件，请通过请求 ID 查看 Cloudflare 日志' };
-        controller.enqueue(encoder.encode(to === 'anthropic' ? event('error', { error }) : data({ error })));
+        controller.enqueue(encoder.encode(streamErrorEvent({ code: 'api_error', message: '上游流中断或包含无法转换的事件，请通过请求 ID 查看 Cloudflare 日志' }, to, requestId, sequence)));
         controller.close();
       }
     },

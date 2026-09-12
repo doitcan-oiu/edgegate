@@ -1,7 +1,7 @@
 import type { Context } from 'hono';
 import type { AppEnv, ApiKey, Protocol } from './types';
 import { ApiError } from './lib/errors';
-import { chatSchema, messagesSchema } from './lib/validation';
+import { chatSchema, messagesSchema, responsesSchema } from './lib/validation';
 import { authenticateKey, canUseModel } from './auth';
 import { consumeLimit } from './lib/rate-limit';
 import { getCandidates, orderCandidates, requestUpstream } from './upstream';
@@ -34,12 +34,21 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
   const key: Pick<ApiKey, 'id' | 'name' | 'rpm' | 'daily_limit' | 'allowed_models' | 'allowed_tags'> = playground
     ? { id: 'playground', name: 'Playground', rpm: 30, daily_limit: 1000, allowed_models: '[]', allowed_tags: '[]' }
     : await authenticateKey(c.req.raw, c.env);
-  const input = (protocol === 'anthropic' ? messagesSchema : chatSchema).parse(await c.req.json()) as InferenceInput;
+  const input = (protocol === 'anthropic' ? messagesSchema : protocol === 'responses' ? responsesSchema : chatSchema).parse(await c.req.json()) as InferenceInput;
   if (!canUseModel(key, input.model)) throw new ApiError(403, 'model_not_allowed', '该密钥没有此模型的访问权限');
   const allowedTags = JSON.parse(key.allowed_tags) as string[];
   const [accessible, settings] = await Promise.all([getCandidates(c.env, input.model, allowedTags), getGatewaySettings(c.env)]);
-  const available = scope ? accessible.filter(candidate => matchesRouteScope(candidate.channel.tags || [], scope)) : accessible;
+  let available = scope ? accessible.filter(candidate => matchesRouteScope(candidate.channel.tags || [], scope)) : accessible;
   if (allowedTags.length && !available.length) throw new ApiError(403, 'model_not_allowed', '该密钥的标签范围内没有此模型的可用服务商');
+  // Provider-owned response/conversation IDs cannot move across upstream accounts.
+  // Until affinity is persisted, state references require a single native channel.
+  if (protocol === 'responses' && (input.previous_response_id || input.conversation)) {
+    const native = available.filter(candidate => candidate.channel.protocol === 'responses');
+    if (new Set(native.map(candidate => candidate.channel_id)).size > 1) {
+      throw new ApiError(400, 'unsupported_response_state', '使用 previous_response_id 或 conversation 时，当前模型的授权范围内必须只有一个 Responses 渠道；请收窄渠道范围，或在 input 中传入完整对话');
+    }
+    if (native.length) available = native;
+  }
   const limit = await consumeLimit(c.env, key.id, key.rpm, key.daily_limit);
   if (!limit.allowed) { c.header('Retry-After', String(limit.retryAfter)); throw new ApiError(429, 'rate_limited', '已达到请求频率或每日请求上限'); }
   const requestId = c.get('requestId');
@@ -101,17 +110,20 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
             await remember(failure); return publicUpstreamError(settings, failure);
           };
           const body = protocol !== upstreamProtocol
-            ? convertStream(response.body, upstreamProtocol, protocol, !!input.stream_options?.include_usage, finish, onError, requestId)
+            ? convertStream(response.body, upstreamProtocol, protocol, protocol !== 'openai' || !!input.stream_options?.include_usage, finish, onError, requestId)
             : forwardStream(response.body, protocol, requestId, finish, onError);
           streaming = true;
           return new Response(body, { headers });
         }
         const raw = await readLimited(response);
-        let result;
-        try { result = JSON.parse(raw); validateResponse(result, upstreamProtocol); }
+        let result, output;
+        try {
+          result = JSON.parse(raw); validateResponse(result, upstreamProtocol);
+          output = protocol === upstreamProtocol ? raw : JSON.stringify(convertResponse(result, upstreamProtocol, protocol));
+        }
         catch { await remember(upstreamFailure(response.status, raw, 'invalid_upstream_response')); continue; }
         headers.set('Content-Type', 'application/json');
-        return new Response(protocol === upstreamProtocol ? raw : JSON.stringify(convertResponse(result, upstreamProtocol, protocol)), { headers });
+        return new Response(output, { headers });
       } catch (error) {
         if (error instanceof ApiError) throw error;
         if (c.req.raw.signal.aborted) throw new ApiError(499, 'client_disconnected', '客户端已断开连接');

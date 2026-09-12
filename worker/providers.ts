@@ -1,4 +1,5 @@
 import type { Env, ProviderProfile } from './types';
+import { PROTOCOL_PATHS } from '../shared/protocols';
 
 type Row = { provider_id: string; protocol: ProviderProfile['protocol']; tags: string; models: string };
 const decode = (row?: Row): ProviderProfile => row ? { protocol: row.protocol, tags: JSON.parse(row.tags), models: JSON.parse(row.models) } : { protocol: 'openai', tags: [], models: [] };
@@ -32,8 +33,8 @@ export async function saveProfile(env: Env, id: string, data: ProviderProfile) {
     ON CONFLICT(provider_id) DO UPDATE SET protocol = excluded.protocol, tags = excluded.tags, models = excluded.models`)
     .bind(id, data.protocol, JSON.stringify(data.tags), JSON.stringify(data.models))];
   if (previous.protocol !== data.protocol) {
-    const from = previous.protocol === 'openai' ? 'chat/completions' : 'messages';
-    const to = data.protocol === 'openai' ? 'chat/completions' : 'messages';
+    const from = PROTOCOL_PATHS[previous.protocol];
+    const to = PROTOCOL_PATHS[data.protocol];
     statements.push(env.DB.prepare(`UPDATE channels SET gateway_path = CASE gateway_path WHEN ? THEN ? WHEN ? THEN ? ELSE gateway_path END WHERE provider_id = ?`)
       .bind(from, to, `v1/${from}`, `v1/${to}`, id));
   }

@@ -40,7 +40,7 @@ export async function getCandidates(env: Env, model?: string, allowedTags: strin
     FROM routes r JOIN channels c ON c.id = r.channel_id JOIN models m ON m.id = r.model_id LEFT JOIN provider_profiles p ON p.provider_id = c.provider_id
     WHERE (? IS NULL OR r.model_id = ?) AND (json_array_length(?) = 0 OR EXISTS (SELECT 1 FROM json_each(p.tags) AS tag JOIN json_each(?) AS allowed ON tag.value = allowed.value)) AND r.enabled = 1 AND c.enabled = 1 AND m.enabled = 1 ORDER BY r.priority, r.id`).bind(model ?? null, model ?? null, JSON.stringify(allowedTags), JSON.stringify(allowedTags)).all<Route & {
       c_name: string; c_kind: Channel['kind']; c_base_url: string; c_secret: string | null; c_timeout: number; c_created: string; c_auto_routes: number;
-      c_protocol: 'openai' | 'anthropic'; c_tags: string; c_provider_id: string | null; c_provider_slug: string | null; c_path: string; c_alias: string;
+      c_protocol: NonNullable<Channel['protocol']>; c_tags: string; c_provider_id: string | null; c_provider_slug: string | null; c_path: string; c_alias: string;
     }>();
   return results.map(r => ({ ...r, channel: {
     protocol: r.c_protocol, tags: JSON.parse(r.c_tags), id: r.channel_id, name: r.c_name, kind: r.c_kind, base_url: r.c_base_url, secret_encrypted: r.c_secret,

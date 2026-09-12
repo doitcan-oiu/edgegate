@@ -1,5 +1,6 @@
 import '../channels.css';
 import { MAX_CHANNEL_TIMEOUT_SECONDS } from '../../shared/channel-limits';
+import { PROTOCOL_FULL_LABELS, PROTOCOL_LABELS, PROTOCOL_PATHS } from '../../shared/protocols';
 import { useContext, useEffect, useRef, useState, type FormEvent } from 'react';
 import { ArrowLeft, ArrowUpRight, ChevronLeft, ChevronRight, Pencil, Plus, Search, Trash2, X } from 'lucide-react';
 import type { Channel, CustomProvider, ProviderPage, ProviderProfile } from '../types';
@@ -32,7 +33,7 @@ function ChannelForm({ channel, onClose }: { channel: Channel | null; onClose: (
     e.preventDefault(); if (fetching) return;
     const committed = providerFields.current?.commitModels();
     if (committed === null) return;
-    const submittedProfile = committed ?? profile;
+    const submittedProfile = kind === 'openai' ? committed ?? profile : { protocol: 'openai' as const, tags: [], models: [] };
     setBusy(true); setError('');
     try {
       await api(`/channels${channel ? `/${channel.id}` : ''}`, { method: channel ? 'PUT' : 'POST', body: JSON.stringify({ ...submittedProfile, auto_create_routes: autoCreateRoutes, update_profile: profileDirty || submittedProfile !== profile, name, kind, base_url: url, secret: kind !== 'openai' || credentialMode === 'local' ? secret || undefined : undefined, credential_mode: kind === 'openai' ? credentialMode : undefined, timeout_ms: timeout * 1000, enabled, provider_id: mode === 'existing' ? providerId : undefined, provider_slug: slug || undefined, gateway_path: path, byok_alias: kind === 'openai' && credentialMode === 'byok' ? alias : '' }) });
@@ -44,13 +45,13 @@ function ChannelForm({ channel, onClose }: { channel: Channel | null; onClose: (
     <Field label="接入方式"><Select value={kind} onChange={value => { setKind(value as Channel['kind']); setSecret(''); setFetching(false); }}>{Object.entries(channelLabel).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</Select></Field>
     </FormSection><FormSection number="02" title="上游连接">{kind === 'openai' ? <>
       {!channel?.provider_id && <Field label="服务商来源"><Select value={mode} onChange={value => { setMode(value); setProviderId(''); setProfileDirty(false); setFetching(false); }}><option value="new">在 Cloudflare 创建新服务商</option><option value="existing">关联已有 Cloudflare 服务商</option></Select></Field>}
-      {mode === 'existing' ? <><ProviderPicker selected={providerId} onSelect={provider => { setProviderId(provider.id); setSlug(provider.slug); setUrl(provider.base_url); setProfile({ protocol: provider.protocol, tags: provider.tags, models: provider.models }); setProfileDirty(false); setAlias(''); setSecret(''); setDiscoverySecret(''); setPath(`${new URL(provider.base_url).pathname.replace(/\/+$/, '').endsWith('/v1') ? '' : 'v1/'}${provider.protocol === 'anthropic' ? 'messages' : 'chat/completions'}`); }} /><div className="info-note">服务商地址：{url || '选择服务商后显示'}</div></> : <><Field label="服务商 Slug" hint="在 Cloudflare 账户内唯一，小写字母、数字和短横线；无需添加 custom- 前缀。"><Input required value={slug} pattern="[a-z0-9]+(-[a-z0-9]+)*" onChange={e => setSlug(e.target.value)} placeholder="my-provider" /></Field><Field label="服务商 Base URL" hint="填写根域名或固定路径前缀，下面的请求路径会原样追加。"><Input type="url" required value={url} onChange={e => setUrl(e.target.value)} placeholder="https://api.example.com" /></Field></>}
-      <Field label="推理请求路径" hint="OpenAI 通常为 v1/chat/completions，Anthropic 为 v1/messages；Base URL 已包含 /v1 时省略该前缀。"><Input required value={path} onChange={e => setPath(e.target.value)} placeholder="v1/chat/completions" /></Field>
+      {mode === 'existing' ? <><ProviderPicker selected={providerId} onSelect={provider => { setProviderId(provider.id); setSlug(provider.slug); setUrl(provider.base_url); setProfile({ protocol: provider.protocol, tags: provider.tags, models: provider.models }); setProfileDirty(false); setAlias(''); setSecret(''); setDiscoverySecret(''); setPath(`${new URL(provider.base_url).pathname.replace(/\/+$/, '').endsWith('/v1') ? '' : 'v1/'}${PROTOCOL_PATHS[provider.protocol]}`); }} /><div className="info-note">服务商地址：{url || '选择服务商后显示'}</div></> : <><Field label="服务商 Slug" hint="在 Cloudflare 账户内唯一，小写字母、数字和短横线；无需添加 custom- 前缀。"><Input required value={slug} pattern="[a-z0-9]+(-[a-z0-9]+)*" onChange={e => setSlug(e.target.value)} placeholder="my-provider" /></Field><Field label="服务商 Base URL" hint="填写根域名或固定路径前缀，下面的请求路径会原样追加。"><Input type="url" required value={url} onChange={e => setUrl(e.target.value)} placeholder="https://api.example.com" /></Field></>}
+      <Field label="推理请求路径" hint="Chat Completions 使用 v1/chat/completions，Responses 使用 v1/responses，Anthropic 使用 v1/messages；Base URL 已包含 /v1 时省略该前缀。"><Input required value={path} onChange={e => setPath(e.target.value)} placeholder={`v1/${PROTOCOL_PATHS[profile.protocol]}`} /></Field>
       <Field label="凭据保存方式"><Select value={credentialMode} onChange={value => { setCredentialMode(value); setSecret(''); }}><option value="local">程序加密存储（推荐）</option><option value="byok">使用已有 Cloudflare BYOK 别名</option></Select></Field>
       {credentialMode === 'local' ? <Field label="供应商 API Key" hint="加密保存在本程序数据库，调用时由 AI Gateway 转发给供应商，无需 Secrets Store。编辑时留空保留原密钥；更换服务商或请求地址需重新填写。"><Input type="password" autoComplete="new-password" required={!(channel?.kind === 'openai' && channel.has_secret)} value={secret} onChange={e => setSecret(e.target.value)} placeholder={channel?.kind === 'openai' && channel.has_secret ? '已加密保存，留空保持不变' : '输入供应商 API Key'} /></Field>
         : <Field label="已有 BYOK 别名" hint="填写此服务商在当前 AI Gateway 中已配置的别名。程序不会上传或修改 Cloudflare 的密钥。"><Input value={alias} onChange={e => setAlias(e.target.value)} placeholder="例如 default" required /></Field>}
       {credentialMode === 'byok' && <Field label="获取模型用 API Key" hint="BYOK 别名无法读取密钥。此处的 Key 仅用于获取模型，不会保存。"><Input type="password" autoComplete="new-password" value={discoverySecret} onChange={e => setDiscoverySecret(e.target.value)} placeholder="需要自动获取模型时填写" /></Field>}
-      <ProviderFields ref={providerFields} key={`${kind}:${mode}:${providerId}`} routeCreation={{ enabled: autoCreateRoutes, onChange: setAutoCreateRoutes }} value={profile} readOnly={busy} discovery={{ base_url: url, secret: (credentialMode === 'local' ? secret : discoverySecret) || undefined, channel_id: credentialMode === 'local' && channel?.has_secret ? channel.id : undefined, provider_id: providerId || undefined }} onLoadingChange={setFetching} onChange={value => { if (value.protocol !== profile.protocol) setPath(previous => previous.replace(/(?:chat\/completions|messages)$/, value.protocol === 'anthropic' ? 'messages' : 'chat/completions')); setProfile(value); setProfileDirty(true); }} />
+      <ProviderFields ref={providerFields} key={`${kind}:${mode}:${providerId}`} routeCreation={{ enabled: autoCreateRoutes, onChange: setAutoCreateRoutes }} value={profile} readOnly={busy} discovery={{ base_url: url, secret: (credentialMode === 'local' ? secret : discoverySecret) || undefined, channel_id: credentialMode === 'local' && channel?.has_secret ? channel.id : undefined, provider_id: providerId || undefined }} onLoadingChange={setFetching} onChange={value => { if (value.protocol !== profile.protocol) setPath(previous => previous === PROTOCOL_PATHS[profile.protocol] ? PROTOCOL_PATHS[value.protocol] : previous === `v1/${PROTOCOL_PATHS[profile.protocol]}` ? `v1/${PROTOCOL_PATHS[value.protocol]}` : previous); setProfile(value); setProfileDirty(true); }} />
       {mode === 'existing' && <div className="info-note">协议、标签和模型清单由此服务商的关联渠道共享；保存修改会同步到本工作空间内的所有关联渠道。</div>}
       {channel?.has_secret && !channel.provider_id && <div className="info-note">此渠道来自旧版直连配置。关联到相同上游地址后可继续使用已加密的密钥，推理会经过 AI Gateway。</div>}
     </> : <><div className="info-note">{kind === 'cloudflare' ? '使用 Cloudflare AI REST API 与统一计费。' : '调用 AI Gateway 的内置模型或 dynamic/ 动态路由；供应商凭据在 Cloudflare BYOK 配置。'} Account ID 和 Gateway ID 在 Worker 环境变量中配置。</div><Field label="Cloudflare Token（可选覆盖）" hint={`留空使用 ${kind === 'cloudflare' ? 'CF_AI_TOKEN' : 'CF_AIG_TOKEN / CF_API_TOKEN'}。`}><Input type="password" autoComplete="new-password" value={secret} onChange={e => setSecret(e.target.value)} placeholder={channel?.has_secret ? '已保存，留空保持不变' : '使用 Worker Secret'} /></Field></>}
@@ -82,7 +83,7 @@ function Providers({ channels }: { channels: Channel[] }) {
     {providers.loading ? <Loading /> : providers.data?.data.length ? <div className="provider-grid">{providers.data.data.map(provider => <article className="surface cloud-provider-card" key={provider.id}>
       <header><div><h2>{provider.name}</h2><code>custom-{provider.slug}</code></div><Badge tone={provider.enable === false ? 'neutral' : 'green'}>{provider.enable === false ? '已停用' : '已启用'}</Badge></header>
       <div className="provider-address"><span className="mini-label">BASE URL</span><code>{provider.base_url}</code></div>
-      <div className="provider-profile"><div><span className="mini-label">协议</span><strong>{provider.protocol === 'anthropic' ? 'Anthropic Messages' : 'OpenAI Chat Completions'}</strong></div><div><span className="mini-label">模型清单</span><strong>{provider.models.length} 个模型</strong></div></div>
+      <div className="provider-profile"><div><span className="mini-label">协议</span><strong>{PROTOCOL_FULL_LABELS[provider.protocol]}</strong></div><div><span className="mini-label">模型清单</span><strong>{provider.models.length} 个模型</strong></div></div>
       <div className="tag-list">{provider.tags.length ? provider.tags.map(tag => <Badge key={tag}>{tag}</Badge>) : <span className="muted">未设置标签</span>}</div>
       <footer><span className="surface-caption">CLOUDFLARE RESOURCE</span><div className="row-actions"><Button variant="secondary" aria-label={`编辑服务商 ${provider.name}`} onClick={() => setEditing(provider)}><Pencil size={15} />编辑</Button><Button variant="ghost" className="icon-btn danger-text" aria-label={`删除服务商 ${provider.name}`} onClick={() => { setDeleting(provider); setError(''); }}><Trash2 size={16} /></Button></div></footer>
     </article>)}</div> : !providers.error && <section className="surface"><Empty title="Cloudflare 暂无自定义服务商" description="创建服务商后即可在本地渠道中关联。" action={<Button variant="secondary" onClick={() => setEditing(null)}><Plus size={16} />创建服务商</Button>} /></section>}
@@ -90,9 +91,9 @@ function Providers({ channels }: { channels: Channel[] }) {
     {editing !== undefined && <ProviderForm provider={editing} channels={channels} onClose={() => setEditing(undefined)} />}{deleting && <Confirm title={`从 Cloudflare 删除 ${deleting.name}？`} description="这会删除账户级服务商，其他应用或 Gateway 使用它的请求也会中断。本程序无法检测其他应用的依赖，请确认已停止使用。" onConfirm={remove} onClose={() => setDeleting(null)} busy={busy} error={error} />}</>;
 
 }
-type ChannelView = 'all' | 'openai' | 'anthropic' | 'configured' | 'pending' | 'disabled';
+type ChannelView = 'all' | 'openai' | 'anthropic' | 'responses' | 'configured' | 'pending' | 'disabled';
 const channelState = (channel: Channel) => !channel.enabled ? 'disabled' : channel.configured ? 'configured' : 'pending';
-const viewLabels: Record<ChannelView, string> = { all: '全部渠道', openai: 'OpenAI 兼容', anthropic: 'Anthropic', configured: '已配置', pending: '待配置', disabled: '已停用' };
+const viewLabels: Record<ChannelView, string> = { all: '全部渠道', ...PROTOCOL_LABELS, configured: '已配置', pending: '待配置', disabled: '已停用' };
 function ChannelEntry({ channel, availability, availabilityData, availabilityLoading, availabilityError, onEdit, onDelete }: {
   channel: Channel; availability?: ChannelAvailabilityReport; availabilityData: ChannelAvailabilityResponse | null;
   availabilityLoading: boolean; availabilityError: string; onEdit: (channel: Channel) => void; onDelete: () => void;
@@ -122,7 +123,7 @@ function ChannelEntry({ channel, availability, availabilityData, availabilityLoa
         </div>}
         <h3 title={channel.name}>{channel.name}</h3>
       </div>
-      <span className={`entry-protocol is-${channel.protocol}`}>{channel.protocol === 'anthropic' ? 'Anthropic' : 'OpenAI 兼容'}</span>
+      <span className={`entry-protocol is-${channel.protocol}`}>{PROTOCOL_LABELS[channel.protocol]}</span>
     </header>
     <div className="channel-entry-body">
       <ChannelAvailability report={availability} data={availabilityData} loading={availabilityLoading} error={availabilityError} />
@@ -161,7 +162,7 @@ export function Channels() {
   const configuredCount = data?.filter(channel => channel.enabled && channel.configured).length;
   const modelCount = data ? new Set(data.flatMap(channel => channel.models)).size : undefined;
   const hasFilters = !!search || view !== 'all';
-  const counts: Record<ChannelView, number | undefined> = { all: data?.length, openai: data?.filter(channel => channel.protocol === 'openai').length, anthropic: data?.filter(channel => channel.protocol === 'anthropic').length, configured: configuredCount, pending: data?.filter(channel => channelState(channel) === 'pending').length, disabled: data?.filter(channel => !channel.enabled).length };
+  const counts: Record<ChannelView, number | undefined> = { all: data?.length, openai: data?.filter(channel => channel.protocol === 'openai').length, anthropic: data?.filter(channel => channel.protocol === 'anthropic').length, responses: data?.filter(channel => channel.protocol === 'responses').length, configured: configuredCount, pending: data?.filter(channel => channelState(channel) === 'pending').length, disabled: data?.filter(channel => !channel.enabled).length };
   function clearFilters() { setSearch(''); setView('all'); setPage(1); }
   function chooseView(next: ChannelView) { setView(next); setPage(1); }
   return <>
@@ -173,7 +174,7 @@ export function Channels() {
 
       <div className="channels-workspace">
         <aside className="channels-sidebar" aria-label="渠道分类">
-          <nav className="channels-category-group" aria-label="按协议筛选"><h2>渠道分类</h2>{(['all', 'openai', 'anthropic'] as const).map(category => <button type="button" className={`channels-category ${view === category ? 'is-selected' : ''}`} data-category={category} aria-pressed={view === category} key={category} onClick={() => chooseView(category)}><span>{viewLabels[category]}</span><span>{counts[category] ?? '—'}</span></button>)}</nav>
+          <nav className="channels-category-group" aria-label="按协议筛选"><h2>渠道分类</h2>{(['all', 'openai', 'responses', 'anthropic'] as const).map(category => <button type="button" className={`channels-category ${view === category ? 'is-selected' : ''}`} data-category={category} aria-pressed={view === category} key={category} onClick={() => chooseView(category)}><span>{viewLabels[category]}</span><span>{counts[category] ?? '—'}</span></button>)}</nav>
           <nav className="channels-category-group" aria-label="按配置状态筛选"><h2>配置状态</h2>{(['configured', 'pending', 'disabled'] as const).map(category => <button type="button" className={`channels-category ${view === category ? 'is-selected' : ''}`} data-category={category} aria-pressed={view === category} key={category} onClick={() => chooseView(category)}><span>{viewLabels[category]}</span><span>{counts[category] ?? '—'}</span></button>)}</nav>
           <div className="channels-sidebar-note"><span>Cloudflare AI Gateway</span><p>统一转发 · 日志 · 缓存</p><a href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">接入文档<ArrowUpRight size={14} /></a></div>
         </aside>

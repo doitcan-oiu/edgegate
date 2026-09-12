@@ -1,3 +1,6 @@
+import type { Protocol } from '../shared/protocols';
+export type { Protocol } from '../shared/protocols';
+
 export interface Env {
   DB: D1Database;
   KV: KVNamespace;
@@ -11,7 +14,6 @@ export interface Env {
   CF_API_TOKEN?: string;
 }
 export type AppEnv = { Bindings: Env; Variables: { requestId: string; sessionId: string } };
-export type Protocol = 'openai' | 'anthropic';
 export interface ProviderProfile { protocol: Protocol; tags: string[]; models: string[] }
 export interface Channel {
   id: string; name: string; kind: 'cloudflare' | 'ai-gateway' | 'openai';

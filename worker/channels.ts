@@ -7,6 +7,7 @@ import { channelConfigured } from './upstream';
 import { profile, profiles, saveProfile, syncCatalog } from './providers';
 import { cfApi, providerPath, publicProvider, type CustomProvider } from './cloudflare';
 import { discoverModels } from './model-discovery';
+import { PROTOCOL_PATHS } from '../shared/protocols';
 
 export const channels = new Hono<AppEnv>();
 channels.post('/providers/models', async c => c.json(await discoverModels(c.env, await c.req.json())));
@@ -72,7 +73,7 @@ async function resolveCustom(env: Env, data: ChannelData, id: string, previous?:
   const exists = await env.DB.prepare('SELECT provider_id FROM provider_profiles WHERE provider_id = ?').bind(provider.id).first();
   if (!exists) await saveProfile(env, provider.id, data);
   const existingProfile = data.update_profile ? data : await profile(env, provider.id);
-  const defaultPath = `${new URL(provider.base_url).pathname.replace(/\/+$/, '').endsWith('/v1') ? '' : 'v1/'}${existingProfile.protocol === 'anthropic' ? 'messages' : 'chat/completions'}`;
+  const defaultPath = `${new URL(provider.base_url).pathname.replace(/\/+$/, '').endsWith('/v1') ? '' : 'v1/'}${PROTOCOL_PATHS[existingProfile.protocol]}`;
   const path = (data.gateway_path || (previousCustom?.provider_id === provider.id ? previousCustom.gateway_path : '') || defaultPath).replace(/^\/+|\/+$/g, '');
   if (!path) throw invalid('上游请求路径不能为空');
   const previousEndpoint = previousCustom?.base_url ? `${safeBaseUrl(previousCustom.base_url)}/${previousCustom.provider_id ? previousCustom.gateway_path : 'chat/completions'}` : '';

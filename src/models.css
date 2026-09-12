@@ -62,6 +62,7 @@
 .route-upstream { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--brand-navy); font-size: 13px; }
 .route-channel { display: block; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .route-protocol { display: block; width: fit-content; margin-top: 2px; padding: 0 4px; border-radius: 2px; background: var(--brand-pale-blue); color: #294e80; font-size: 12px; line-height: 1.4; }
+.route-protocol.is-responses { background: var(--brand-pale-green); color: var(--brand-green); }
 .route-protocol.is-anthropic { background: var(--brand-coral-tint); color: var(--brand-coral-ink); }
 .route-table .route-numeric { padding-inline: 8px; text-align: center; font-variant-numeric: tabular-nums; }
 .priority-token { color: var(--brand-green); font: 12px var(--font-mono); }
@@ -85,6 +86,16 @@
 .routing-workspace .empty-icon { display: none; }
 .routing-workspace .empty-state h3 { font-size: 15px; font-weight: 500; }
 .routing-workspace .empty-state p { margin-top: 5px; }
+.route-model-picker { width: 100%; min-width: 0; }
+.route-model-picker [data-slot="combo-box-input-group"] { min-height: 34px; padding: 0 2px 0 0; border: 1px solid var(--field-border); border-radius: 4px; background: var(--surface); box-shadow: none; }
+.route-model-picker [data-slot="combo-box-input-group"]:focus-within { border-color: var(--focus); }
+.route-model-picker .eg-input { width: 100%; min-width: 0; min-height: 32px; height: 32px; padding: 5px 9px; border: 0; border-radius: 4px; background: transparent; font-size: 13px; box-shadow: none; }
+.route-model-picker .eg-input:focus { outline: 0; }
+.route-model-picker [data-slot="combo-box-trigger"] { width: 28px; height: 28px; min-height: 28px; padding: 6px; color: var(--muted); background: transparent; }
+.route-model-options { max-width: calc(100vw - 32px); max-height: 260px; overflow-y: auto; overscroll-behavior: contain; border: 1px solid var(--border); border-radius: 4px; font-size: 13px; }
+.route-model-options .list-box-item { min-height: 32px; padding: 6px 8px; }
+.route-model-options .list-box-item > span { overflow-wrap: anywhere; }
+.route-model-empty { display: block; padding: 10px; color: var(--muted); font-size: 12px; }
 @media (max-width: 1100px) {
   .model-workspace { grid-template-columns: 224px minmax(0,1fr); }
   .routing-workspace { padding-inline: 14px; }

@@ -3,11 +3,11 @@ import type { Channel, Env } from './types';
 import { decryptSecret } from './lib/crypto';
 import { ApiError, invalid } from './lib/errors';
 import { readLimited } from './lib/stream';
-import { MAX_PROVIDER_MODELS, modelId, safeBaseUrl } from './lib/validation';
+import { MAX_PROVIDER_MODELS, modelId, protocolSchema, safeBaseUrl } from './lib/validation';
 
 const discoverySchema = z.object({
   base_url: z.string().trim().min(1).max(500),
-  protocol: z.enum(['openai', 'anthropic']).default('openai'),
+  protocol: protocolSchema.default('openai'),
   secret: z.string().trim().max(4096).optional(),
   channel_id: z.string().min(1).max(100).optional(),
   provider_id: z.string().min(1).max(100).optional(),
