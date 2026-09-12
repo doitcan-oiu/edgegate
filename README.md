@@ -6,7 +6,7 @@
 
 基于 **Cloudflare Workers + AI Gateway + D1 + KV** 的大模型网关管理程序。React 19 + HeroUI 3 + Tailwind CSS 4 前端，Hono + TypeScript 后端。功能参考 AxonHub 的统一模型接入场景，目前为单管理员、单工作空间。
 
-**自定义服务商的推理请求全部经过 Cloudflare AI Gateway。** 供应商 API Key 默认由本程序加密保存在 D1，无需配置 BYOK 或 Secrets Store。本程序调用 Cloudflare API 管理服务商，通过 Cron 同步 Cloudflare 日志元数据与 GraphQL 统计到 D1，页面从 D1 读取；费用仍采用 Cloudflare 数据。
+**自定义服务商的推理请求全部经过 Cloudflare AI Gateway。** 供应商 API Key 默认由本程序加密保存在 D1，无需配置 BYOK 或 Secrets Store。本程序调用 Cloudflare API 管理服务商，页面加载、筛选、分页及刷新时由 Worker 直接读取 Cloudflare REST 日志与 GraphQL 统计；费用采用 Cloudflare 数据，D1 / KV 不缓存这些数据。
 
 部署请阅读 [Workers 部署指南](./DEPLOYMENT.md)，包含 GitHub 自动部署、一键部署按钮、命令行部署和首次配置步骤。
 
@@ -18,9 +18,9 @@ flowchart LR
     UI[React 管理控制台] -->|管理会话| Worker
     Worker -->|推理| AIG[Cloudflare AI Gateway]
     AIG --> Custom[自定义服务商]
-    Worker -->|服务商管理 / Cron 同步| API[Cloudflare REST + GraphQL API]
-    Worker --> D1[(D1 · 业务配置 / 配额 / 日志与统计缓存)]
-    Worker --> KV[(KV · 会话与分析 Schema 缓存)]
+    Worker -->|服务商管理 / 日志与统计直读| API[Cloudflare REST + GraphQL API]
+    Worker --> D1[(D1 · 业务配置 / 配额 / 错误追踪)]
+    Worker --> KV[(KV · 管理员会话)]
 ```
 
 | 能力 | 实现位置 |
@@ -28,8 +28,8 @@ flowchart LR
 | 自定义服务商注册、查询、修改与删除 | Cloudflare Custom Providers API，账户级资源 |
 | 供应商密钥 | 默认 AES-256-GCM 加密保存到 D1，也可引用已有 Cloudflare BYOK 别名 |
 | 模型转发、日志采集、缓存、用量与费用数据 | Cloudflare AI Gateway |
-| 日志列表与详情 | Cron 同步元数据到 D1，页面本地查询 / 分页 |
-| 总览、趋势、模型分布 | Cloudflare GraphQL `aiGatewayRequestsAdaptiveGroups` 快照，D1 缓存 |
+| 日志列表与详情 | 每次页面请求直接读取 Cloudflare REST API |
+| 总览、趋势、模型分布 | 每次页面请求直接读取 Cloudflare GraphQL `aiGatewayRequestsAdaptiveGroups` |
 | 应用 API Key、模型权限、模型别名、渠道映射、原子配额 | Worker + D1 |
 | 管理员会话 | Workers KV |
 
@@ -153,7 +153,7 @@ curl https://YOUR-WORKER.workers.dev/v1/messages \
 - 同协议请求保留原协议扩展。跨协议转换只发送目标协议可映射的参数，其余可选参数自动省略，例如 `frequency_penalty`、`presence_penalty`、缓存提示、扩展 thinking、Anthropic 不支持的 JSON `response_format` / `top_k`。转换到只支持单个结果的协议时省略 `n`，请求仍正常发送。不支持的工具定义及其强制选择也会省略，保留可转换的函数工具。
 - OpenAI → Anthropic 未指定输出长度时使用 `max_tokens=4096`；超出转换器支持范围 0–1 的 `temperature` 会省略，由上游使用默认值。同时提供 `max_completion_tokens` 与 `max_tokens` 时，优先使用 `max_completion_tokens`。每次故障转移都从原始请求重新转换，不会影响后续同协议渠道接收原参数。
 - 消息正文、图片、工具调用参数与结果仍需正确且可转换；无法表示的实际内容返回 `unsupported_conversion`，可继续尝试其他匹配协议的渠道。上游响应与 SSE 完整性校验保持生效，不会通过丢弃回答内容来伪造成功。
-- Anthropic 客户端调用 OpenAI 服务商时，流式请求会向上游请求 `include_usage`。Anthropic 的初始流式计数从 0 开始，结束事件更新为上游报告值；若上游缺少必要用量、缺少结束事件或出现无法表示的内容，转换会报错。不会自行补算用量或账单；后台仍会同步 Cloudflare 实际报告的记录。
+- Anthropic 客户端调用 OpenAI 服务商时，流式请求会向上游请求 `include_usage`。Anthropic 的初始流式计数从 0 开始，结束事件更新为上游报告值；若上游缺少必要用量、缺少结束事件或出现无法表示的内容，转换会报错。不会自行补算用量或账单；页面展示 Cloudflare 实际报告的记录。
 - 供应商认证按上游协议选择：OpenAI Chat Completions / Responses 使用 Bearer，Anthropic 使用 `x-api-key`。故障转移时按候选渠道重新选择密钥和认证头。其他私有认证方式尚不支持；已有 BYOK 模式使用 Cloudflare 对应的凭据配置。
 
 Responses 与 Chat Completions 之间保留显式的函数工具 `strict`。Responses 未指定时，已符合严格模式的 schema 使用 `true`，其他 schema 使用 `false`；转换到 Anthropic 时省略 `strict` 约束，保留函数名与 schema。跨协议会省略不支持的 `background`、存储、流式扩展和格式选项；实际非空 reasoning、加密推理内容及无法转换的上游输出仍需匹配协议的渠道。
@@ -219,24 +219,22 @@ Playground 同样通过标签按钮选择调试范围，只列出该范围中已
 
 ## 日志与分析
 
-数据来源仍是 Cloudflare AI Gateway，由 Worker Cron 定时同步到 D1。网页、日志分页 / 筛选 / 详情、总览刷新不再直接请求 CF 控制接口。
+数据来源是 Cloudflare AI Gateway。打开页面、刷新、切换统计范围、日志筛选与分页时，Worker 都会直接读取 Cloudflare，浏览器不会持有 Cloudflare Token。没有后台数据同步、历史回补或本地保留期设置。
 
-| 内容 | 同步频率 / 保留 |
+| 内容 | 读取方式 |
 | --- | --- |
-| 最新日志 | 每 2 分钟从第一页读取最新 4 页 |
-| 近期日志复查 | 每 15 分钟安排分页重读，按本地 2 小时回看边界复查长 SSE 等延迟数据 |
-| 24 小时 / 7 天统计快照 | 每 5 / 15 分钟 |
-| 历史日志 | 从最新向前分批分页，读取到本地保留边界或 CF 页尾后结束本轮，定期重扫 |
-| 本地日志保留期 | 默认 7 天，可在「网关设置 → 数据同步」切换 30 天，边界在本地判断 |
+| 日志列表、筛选与分页 | Cloudflare REST API，按 `created_at` 降序读取 |
+| 日志详情 | 每次打开直接读取 Cloudflare REST API，并关联 D1 中的上游错误追踪 |
+| 总览、趋势、模型分布 | Cloudflare GraphQL，统计整个网关的过去 24 小时或 7 天 |
+| 渠道可用率 | 本次请求分页读取 Cloudflare 最近 1 小时日志，并按渠道 ID 汇总 |
+| 数据保留 | 由 Cloudflare AI Gateway 的日志设置决定 |
 
-- Cron 每分钟检查到期任务，不需要保持网页或电脑开启。每类任务使用 D1 原子租约，单轮有页数及时间预算；近期复查与历史分页跨轮续扫时重叠读取一页，最新日志每轮重新从第一页读取。高流量或 CF 接口慢时，同步会滞后，页面显示成功时间和状态。
-- 「立即同步」通过 `POST /api/observability/sync` 将请求持久化到 D1，在下一分钟的 Cron 开始；重复点击会合并。任务不依赖 HTTP 请求结束后的 `waitUntil` 寿命。`GET /api/observability` 读取同步进度，`PUT /api/config/observability` 设置日志保留期。
-- 所有日志同步请求按 `created_at` 降序分页，不向 Cloudflare 传开始 / 结束日期筛选。日志以 Cloudflare log ID 去重更新，不以 EdgeGate request ID 合并重试；重复读取近期页面可更新长 SSE 请求结束后的状态、用量等数据。保存元数据与页进度的操作为原子批次，较早发出但较晚返回的同步结果不能覆盖更新的观察值。CF API 没有稳定快照游标或明确的入库延迟保证，分页过程中新增或删除记录会使页面位置变化；扫描进度与记录时间不表示已完整覆盖某个时间范围，重读降低漏记风险，不能恢复 CF 未采集、已删除的记录。
-- 渠道卡片显示最近 1 小时的分段可用率，共 30 块，每块代表 2 分钟。`GET /api/channels/availability` 按日志中的渠道 ID 从 D1 汇总成功率，同名渠道互不混用；缓存命中、缺少成功状态或渠道 ID 的记录不参与统计。重试按各次上游尝试计算，灰色表示无有效样本。这是已同步请求的成功率，不是主动探测在线率；同步延迟和历史回补会单独标示。升级前缓存中缺少渠道 ID 的记录需等待后台重新同步后才会计入。
-- 本地只缓存列表与现有详情需要的元数据，不复制请求 / 响应正文、认证头。缺失的状态、Token 或费用显示「未报告」或 `—`。本地总条数、筛选和分页只针对已同步且在保留期内的记录；可以查看最早记录及历史分页进度。
-- 统计来自 GraphQL 的整个网关聚合，不以本地日志条数补算请求量、用量和费用。快照保留自身的起止时间，图表按该时间窗口绘制，过期快照不会把尚未同步的时段画成 0。
-- 同步失败保留最后成功的快照与日志；首次没有快照时显示等待同步及错误，不伪造零流量。数据按 Account / Gateway 隔离，Token 轮换保留同一资源的缓存。KV 仅用于会话及分析 Schema 字段缓存。
-- 7 / 30 天保留期用于本地日志保留、展示和过期清理；扫描时也在本地判断是否已读到保留边界，不作为上游日志请求的日期条件。缩短后立即按新范围查询，Cron 分批清理过期行；再次延长会重新扫描，并撤销旧日志任务租约，避免沿用过时进度。保留更多日志会增加 D1 存储与写入，向前扫描也会增加 CF 读取次数，请根据请求量选择。
+- Cloudflare REST 读取及 GraphQL 查询遇到 HTTP 5xx 时，最多额外重试 2 次（共最多 3 次请求）。重试后仍失败会返回错误，页面提供重试 / 刷新操作，不将失败显示为零流量或无日志。
+- D1 不保存 Cloudflare 日志、统计快照、同步状态或数据保留设置；KV 不缓存 Cloudflare 数据或分析 Schema，只保存管理员会话。D1 继续保存业务配置、配额和上游错误追踪。
+- 日志总条数采用 Cloudflare 返回值，未报告时显示「—」；是否能翻到下一页由响应的 `has_more` 决定。分页过程中 Cloudflare 新增或删除记录可能改变页面位置，日志保留与可见范围以 Cloudflare 当前返回为准。
+- 渠道卡片显示最近 1 小时的分段可用率，共 30 块，每块代表 2 分钟。按日志中的渠道 ID 汇总，同名渠道互不混用；缓存命中、缺少成功状态或渠道 ID 的记录不参与统计。重试按各次上游尝试计算，灰色表示本次样本中无有效记录。这是实际请求样本的成功率，不是主动探测在线率。
+- 可用率响应包含统计时间范围、读取时间、有效唯一样本数和 `coverage`。达到本次读取预算、分页未前进或后续页读取失败时，`coverage: "partial"`，页面标明「样本不完整」及原因；首个 Cloudflare 请求失败会显示读取错误。`complete` 仅表示本次已读完 Cloudflare 可返回的时间范围，不能恢复未采集、延迟出现或已删除的日志。
+- 统计来自 GraphQL 的整个网关聚合，不以日志样本补算请求量、用量和费用。图表按本次返回的起止时间绘制。缺失的状态、Token 或费用显示「未报告」或 `—`。
 
 - 范围为当前 AI Gateway 的全部调用，包含其他客户端。一次 EdgeGate 请求发生故障转移时，可能生成多条 Cloudflare 日志。
 - 通过 `cf-aig-metadata` 传递请求 ID、应用 Key ID/名称、模型别名、渠道与尝试序号。返回 `X-Request-ID`、`X-Gateway-Attempts`，以及上游提供的 `cf-aig-log-id`，便于关联。
@@ -253,7 +251,7 @@ npm run db:migrate          # 本地
 npm run db:migrate:remote
 ```
 
-`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。`0005_channel_auto_routes.sql` 新增渠道自动路由开关，现有渠道默认开启。`0006_long_channel_timeout.sql` 将渠道超时上限放宽到 3600 秒，保留现有渠道、密钥和路由。`0007_observability_cache.sql` 新增日志元数据、统计快照、同步状态和保留期配置表，不修改历史业务数据。`0008_responses_protocol.sql` 扩展服务商协议约束以支持 Responses，并保留现有服务商、标签和模型清单；升级时需应用此迁移。Cron 每分钟调度同步并清理过期缓存，原配额与 7 天错误追踪的清理仍在每天 UTC 03:15 执行。
+`0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。`0005_channel_auto_routes.sql` 新增渠道自动路由开关，现有渠道默认开启。`0006_long_channel_timeout.sql` 将渠道超时上限放宽到 3600 秒，保留现有渠道、密钥和路由。`0007_observability_cache.sql` 是旧版观测数据缓存迁移。`0008_responses_protocol.sql` 扩展服务商协议约束以支持 Responses，并保留现有服务商、标签和模型清单；升级时需应用此迁移。`0009_remove_observability_cache.sql` 删除旧版的 `observability_logs`、`observability_snapshots`、`observability_jobs` 和 `observability_settings` 四张表，保留渠道、模型、密钥、配额、历史 `request_logs` 与上游错误追踪。升级时应用全部未执行的迁移；旧 Cloudflare 数据缓存将被移除，页面改为直接读取 Cloudflare。Cron 仅在每天 UTC 03:15 清理过期配额和 7 天上游错误追踪，不负责读取 Cloudflare 数据。
 
 旧「OpenAI 兼容」直连渠道会显示待配置，**不会继续直连供应商**。编辑渠道，将其关联到 Cloudflare 服务商，并确认请求路径。仅当完整上游 URL 与旧地址完全一致时，才会保留原有加密 Key；目的地不一致需重新输入密钥或提供已有 BYOK 别名。关联后推理经过 AI Gateway，密钥继续加密保存在 D1。
 
@@ -301,10 +299,8 @@ worker/
   admin.ts              业务配置管理
   channels.ts           Cloudflare 服务商与本地渠道映射
   cloudflare.ts          Cloudflare REST / GraphQL 客户端
-  observability.ts       日志与统计的 D1 查询接口
-  observability-sync.ts  Cron 同步、分页水位与日志清理
-  observability-store.ts 同步状态、保留期与手动任务请求
-  cloudflare-observability.ts Cloudflare 日志与 GraphQL 读取
+  observability.ts       日志、统计与渠道可用率直读接口
+  cloudflare-observability.ts Cloudflare 日志与 GraphQL 直接读取
   gateway.ts            应用配额、故障转移与 SSE 透传
   upstream.ts           AI Gateway 端点与标签范围内的路由选择
   providers.ts          协议、标签、模型清单与自动路由

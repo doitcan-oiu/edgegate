@@ -1,4 +1,3 @@
-import type { SyncJobStatus } from '../shared/observability';
 import type { Protocol } from '../shared/protocols';
 export type { Protocol } from '../shared/protocols';
 export interface Channel {
@@ -21,12 +20,12 @@ export interface ApiKey {
   expires_at: string | null; revoked_at: string | null; created_at: string; requests_today: number;
 }
 export interface Log {
-  upstream_error?: UpstreamErrorTrace | null; synced_at?: string;
+  upstream_error?: UpstreamErrorTrace | null;
   id: string; request_id: string | null; model: string; channel_name: string; key_name: string; status: number | null; success: boolean; latency_ms: number;
   input_tokens: number | null; output_tokens: number | null; cost_usd: number | null;
   cached: number; stream: number; attempts: number | null; error_code: string | null; created_at: string; upstream_model: string | null; provider: string;
 }
-export interface LogPage { data: Log[]; total: number | null; page: number; page_size: number; has_more: boolean; source: 'cloudflare'; storage: 'd1'; retention_days: number; sync: SyncJobStatus }
+export interface LogPage { data: Log[]; total: number | null; page: number; page_size: number; has_more: boolean; source: 'cloudflare'; gateway_id: string }
 export interface Config {
   runtime: GatewaySettings;
   account_id: string; gateway_id: string; ai_token_configured: boolean; aig_token_configured: boolean;
@@ -37,7 +36,7 @@ export interface Stats {
     cost_usd: number | null; cache_hits: number | null } | null;
   series: { time: string; requests: number; errors: number | null }[];
   models: { model: string; requests: number }[]; range: '24h' | '7d';
-  source: 'cloudflare'; scope: 'gateway'; gateway_id: string; storage: 'd1';
-  window_start: string | null; window_end: string | null; synced_at: string | null; sync: SyncJobStatus;
+  source: 'cloudflare'; scope: 'gateway'; gateway_id: string;
+  window_start: string; window_end: string;
 }
 import type { GatewaySettings, UpstreamErrorTrace } from '../shared/gateway-settings';

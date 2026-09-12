@@ -6,7 +6,6 @@ import { Miniflare, convertV4MiniflareOptions, Response as MFResponse, type Requ
 import { decryptSecret, encryptSecret } from '../worker/lib/crypto';
 import { orderCandidates } from '../worker/upstream';
 import { safeBaseUrl } from '../worker/lib/validation';
-import { getChannelAvailability } from '../worker/channel-availability';
 import { normalizeLog } from '../worker/cloudflare-observability';
 import type { ChannelAvailabilityResponse } from '../shared/observability';
 import type { Candidate, Channel, Env, Model, Protocol, Route } from '../worker/types';
@@ -24,8 +23,9 @@ let mf: Miniflare, db: Awaited<ReturnType<Miniflare['getD1Database']>>, cookie =
 let upstream: (request: MFRequest) => Promise<MFResponse> | MFResponse;
 let calls: Recorded[], modelCalls: Recorded[], controlCalls: Recorded[], providers: Map<string, Provider>, remoteLogs: RemoteLog[];
 let modelResponse: (request: MFRequest) => Promise<MFResponse> | MFResponse;
-let controlFailure = 0, graphqlFailure = false, logFailurePage = 0;
-let logRepeatFirstPage = false, logPageInfo: 'pages' | 'count' | 'none' = 'pages';
+let controlFailure = 0, graphqlFailure = false;
+let controlStatuses: number[] = [];
+let logPageInfo: 'pages' | 'count' | 'none' = 'pages';
 const ok = (result: unknown, info?: unknown) => MFResponse.json({ success: true, result, ...(info ? { result_info: info } : {}) });
 const fail = (status: number) => MFResponse.json({ success: false, errors: [{ message: 'sensitive Cloudflare response' }] }, { status });
 
@@ -34,7 +34,8 @@ async function outbound(req: MFRequest): Promise<MFResponse> {
   const record = { url: req.url, headers: Object.fromEntries(req.headers), body };
   if (url.hostname === 'api.cloudflare.com' && !url.pathname.includes('/ai/v1/')) {
     controlCalls.push(record);
-    if (controlFailure) return fail(controlFailure);
+    const status = controlStatuses.shift() || controlFailure;
+    if (status) return fail(status);
     // This account has no Secrets Store permissions; custom keys must stay in D1.
     if (url.pathname.includes('/secrets_store/') || url.pathname.endsWith('/provider_configs')) return fail(403);
     if (url.pathname.endsWith('/graphql')) {
@@ -62,13 +63,12 @@ async function outbound(req: MFRequest): Promise<MFResponse> {
     }
     if (url.pathname === `${root}/gateways/test-gateway/logs`) {
       const page = Number(url.searchParams.get('page') || 1), per = Number(url.searchParams.get('per_page') || 25);
-      if (logFailurePage === page) return fail(503);
-      // Cloudflare lists the gateway's logs newest first. Date/model/status
-      // parameters deliberately have no effect: filtering belongs in local D1.
-      const rows = [...remoteLogs].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id));
-      const current = logRepeatFirstPage ? 1 : page;
+      let rows = [...remoteLogs].sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id));
+      if (url.searchParams.has('success')) rows = rows.filter(row => row.success === (url.searchParams.get('success') === 'true'));
+      if (url.searchParams.has('model')) rows = rows.filter(row => row.model === url.searchParams.get('model'));
+      if (url.searchParams.has('search')) rows = rows.filter(row => row.id.includes(url.searchParams.get('search')!));
       const info = logPageInfo === 'none' ? undefined : { total_count: rows.length, ...(logPageInfo === 'pages' ? { total_pages: Math.ceil(rows.length / per) } : {}) };
-      return ok(rows.slice((current - 1) * per, current * per), info);
+      return ok(rows.slice((page - 1) * per, page * per), info);
     }
     if (url.pathname.startsWith(`${root}/gateways/test-gateway/logs/`)) return remoteLogs.find(l => l.id === url.pathname.split('/').at(-1)) ? ok(remoteLogs.find(l => l.id === url.pathname.split('/').at(-1))) : fail(404);
     return fail(404);
@@ -110,18 +110,17 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql', '0009_remove_observability_cache.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
 });
 beforeEach(async () => {
-  await db.prepare('UPDATE observability_settings SET log_retention_days = 7 WHERE id = 1').run();
-  calls = []; modelCalls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false; logFailurePage = 0;
-  logRepeatFirstPage = false; logPageInfo = 'pages';
+  calls = []; modelCalls = []; controlCalls = []; providers = new Map(); remoteLogs = []; controlFailure = 0; graphqlFailure = false; controlStatuses = [];
+  logPageInfo = 'pages';
   modelResponse = () => MFResponse.json({ data: [{ id: 'model-a' }, { id: 'model-b' }, { id: 'model-a' }] });
   upstream = () => MFResponse.json(completion);
-  await db.batch(['observability_jobs', 'observability_snapshots', 'observability_logs', 'gateway_settings', 'upstream_error_traces', 'provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
+  await db.batch(['gateway_settings', 'upstream_error_traces', 'provider_profiles', 'request_logs', 'key_counters', 'api_keys', 'routes', 'models', 'channels'].map(table => db.prepare(`DELETE FROM ${table}`)));
   const response = await request('/api/auth/login', { body: { token: ADMIN } }); expect(response.status).toBe(200);
   cookie = response.headers.get('set-cookie')!.split(';')[0];
   await admin('/models', { id: 'test-model' });
@@ -393,26 +392,13 @@ describe('AI Gateway inference', () => {
   });
 });
 
-async function runSync(force = false) {
-  if (force) await admin('/observability/sync', {}, 'POST');
-  const result = await (await mf.getWorker()).scheduled({ cron: '* * * * *', scheduledTime: new Date() });
-  expect(result.outcome).toBe('ok');
-  for (const call of controlCalls) {
-    const url = new URL(call.url);
-    if (url.pathname !== `${root}/gateways/test-gateway/logs`) continue;
-    expect([...url.searchParams.keys()].sort()).toEqual(['meta_info', 'order_by', 'order_by_direction', 'page', 'per_page']);
-    expect(Object.fromEntries(url.searchParams)).toMatchObject({ meta_info: 'true', per_page: '50', order_by: 'created_at', order_by_direction: 'desc' });
-    expect(Number(url.searchParams.get('page'))).toBeGreaterThanOrEqual(1);
-  }
-}
-
-describe('Cloudflare observability synchronized to D1', () => {
-  it('keeps stable channel IDs in cached logs without guessing from names', () => {
+describe('Cloudflare observability read directly', () => {
+  it('keeps stable channel IDs without guessing from names', () => {
     expect(normalizeLog(logFixture({ metadata: JSON.stringify({ channel_id: 'channel-a', channel_name: 'Same name' }) }))).toMatchObject({ channel_id: 'channel-a', channel_name: 'Same name' });
     expect(normalizeLog(logFixture())).toMatchObject({ channel_id: null, channel_name: 'Primary' });
     expect(normalizeLog(logFixture({ metadata: '{invalid' }))).toMatchObject({ channel_id: null });
   });
-  it('aggregates channel availability from D1 by stable ID, preserving attempt outcomes and sync errors', async () => {
+  it('aggregates live channel availability by stable ID and reads again on refresh', async () => {
     const primary = (await db.prepare("SELECT id FROM channels WHERE name = 'Primary'").first<{ id: string }>())!.id;
     const fallback = await channel('Fallback', 'fallback.example.com');
     await db.prepare("UPDATE channels SET name = 'Same name'").run();
@@ -425,278 +411,111 @@ describe('Cloudflare observability synchronized to D1', () => {
       logFixture({ id: 'b-ok', metadata: metadata(fallback), created_at }),
       logFixture({ id: 'unattributed', created_at }),
     ];
-    await runSync(); controlCalls = []; controlFailure = 503;
-    await db.prepare("UPDATE observability_jobs SET last_error = '暂时无法同步', last_success_at = ? WHERE job = 'logs:head'").bind(new Date(Date.now() - 600000).toISOString()).run();
+    controlCalls = [];
     const result = await admin<ChannelAvailabilityResponse>('/channels/availability');
-    expect(result).toMatchObject({ storage: 'd1', sync: { state: 'error', stale: true } });
+    expect(result).toMatchObject({ source: 'cloudflare', coverage: 'complete', sampled_logs: 3 });
     const a = result.data.find(row => row.channel_id === primary)!;
     expect(a).toMatchObject({ requests: 2, successes: 1, rate: 0.5 });
     expect(a.buckets).toHaveLength(30);
     expect(a.buckets.filter(row => row.requests)).toEqual([expect.objectContaining({ requests: 2, successes: 1, rate: 0.5 })]);
     expect(result.data.find(row => row.channel_id === fallback)).toMatchObject({ requests: 1, successes: 1, rate: 1 });
-    expect(controlCalls).toEqual([]);
+    expect(controlCalls).toHaveLength(1);
     expect((await request('/api/channels/availability')).status).toBe(401);
-    controlFailure = 0; remoteLogs[1].success = true; remoteLogs[1].status_code = 200;
-    await runSync(true);
+    remoteLogs[1].success = true; remoteLogs[1].status_code = 200;
     expect((await admin<ChannelAvailabilityResponse>('/channels/availability')).data.find(row => row.channel_id === primary)).toMatchObject({ requests: 2, successes: 2, rate: 1 });
+    expect(controlCalls).toHaveLength(2);
   });
-  it('bounds availability to one hour in two-minute buckets with empty, unknown and foreign records excluded', async () => {
-    const primary = (await db.prepare("SELECT id FROM channels WHERE name = 'Primary'").first<{ id: string }>())!.id;
-    const empty = await channel('Empty', 'empty.example.com');
-    const end = Date.parse('2026-09-12T06:00:00.000Z'), start = end - 3600000;
-    const scope = JSON.stringify(['v1', account, 'test-gateway']);
-    const cases = [
-      { id: 'too-old', at: start - 1 }, { id: 'first', at: start }, { id: 'last-in-first', at: start + 120000 - 1, success: false },
-      { id: 'second', at: start + 120000, success: false }, { id: 'last', at: end - 1 }, { id: 'future', at: end },
-      { id: 'foreign', at: start, scope: 'other-gateway' }, { id: 'unknown', at: start, success: null },
-      { id: 'old-payload', at: start, channel_id: null }, { id: 'deleted-channel', at: start, channel_id: 'deleted' },
-      { id: 'cached', at: start, cached: 1 },
-    ];
-    await db.batch(cases.map(row => db.prepare('INSERT INTO observability_logs (scope,id,created_at,success,upstream_model,payload,synced_at) VALUES (?,?,?,?,?,?,?)').bind(
-      row.scope || scope, row.id, new Date(row.at).toISOString(), row.success === false ? 0 : 1, 'cloud-model',
-      JSON.stringify({ channel_id: row.channel_id === undefined ? primary : row.channel_id, success: row.success === undefined ? true : row.success, cached: row.cached || 0 }), new Date(end).toISOString(),
-    )));
-    const env = { DB: db, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway' } as unknown as Env;
-    const result = await getChannelAvailability(env, end);
-    expect(result).toMatchObject({ window_start: new Date(start).toISOString(), window_end: new Date(end).toISOString(), backfilling: true });
-    const a = result.data.find(row => row.channel_id === primary)!;
-    expect(a).toMatchObject({ requests: 4, successes: 2, rate: 0.5 });
-    expect(a.buckets[0]).toMatchObject({ requests: 2, successes: 1, rate: 0.5 });
-    expect(a.buckets[1]).toMatchObject({ requests: 1, successes: 0, rate: 0 });
-    expect(a.buckets[29]).toMatchObject({ requests: 1, successes: 1, rate: 1 });
-    expect(a.buckets.slice(2, 29).every(row => row.requests === 0 && row.rate === null)).toBe(true);
-    expect(result.data.find(row => row.channel_id === empty)).toMatchObject({ requests: 0, rate: null });
-    expect(controlCalls.filter(call => call.url.includes('/logs'))).toEqual([]);
-  });
-  it('exposes repair failures even when recent logs and historical coverage are current', async () => {
-    await runSync();
-    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify({ version: 2, covered_from: new Date(Date.now() - 90 * 60000).toISOString(), covered_to: new Date().toISOString() })).run();
-    await db.prepare("UPDATE observability_jobs SET cursor = NULL, last_error = '旧日志修复失败' WHERE job = 'logs:repair'").run();
-    const result = await admin<ChannelAvailabilityResponse>('/channels/availability');
-    expect(result).toMatchObject({ backfilling: false, sync: { state: 'ready', stale: false } });
-    expect(result.jobs.find(job => job.job === 'logs:repair')).toMatchObject({ state: 'error', last_error: '旧日志修复失败' });
-    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify({ version: 2, covered_from: new Date(Date.now() - 30 * 60000).toISOString(), covered_to: new Date().toISOString() })).run();
-    expect(await admin('/channels/availability')).toMatchObject({ backfilling: true });
-  });
-  it('reads paginated cached logs without contacting Cloudflare, preserving metadata correlation', async () => {
+  it('reads only the requested page directly and preserves metadata correlation', async () => {
     remoteLogs = Array.from({ length: 26 }, (_, i) => logFixture({ id: `remote-${i}`, created_at: new Date(Date.now() - i * 1000).toISOString() }));
-    await runSync(); controlCalls = [];
+    controlCalls = [];
     const result = await admin<{ data: Record<string, unknown>[]; total: number; has_more: boolean }>('/logs?page=2');
-    expect(result.total).toBe(26); expect(result.has_more).toBe(false); expect(result.data).toHaveLength(1); expect(result.data[0]).toMatchObject({ id: 'remote-25', request_id: 'edge-request', model: 'test-model', upstream_model: 'cloud-model', status: 200, key_name: 'Test app', source: 'cloudflare' });
-    expect(controlCalls).toEqual([]);
+    expect(result.total).toBe(26); expect(result.has_more).toBe(false); expect(result.data).toHaveLength(1);
+    expect(result.data[0]).toMatchObject({ id: 'remote-25', request_id: 'edge-request', model: 'test-model', upstream_model: 'cloud-model', status: 200, key_name: 'Test app', source: 'cloudflare' });
+    expect(controlCalls).toHaveLength(1);
+    expect(Object.fromEntries(new URL(controlCalls[0].url).searchParams)).toEqual({ page: '2', per_page: '25', order_by: 'created_at', order_by_direction: 'desc', meta_info: 'true' });
+    expect(result).not.toHaveProperty('storage'); expect(result).not.toHaveProperty('sync');
+    remoteLogs[25].tokens_out = 900;
+    expect(await admin('/logs?page=2')).toMatchObject({ data: [{ output_tokens: 900 }] });
+    expect(controlCalls).toHaveLength(2);
   });
-  it.each(['count', 'none'] as const)('continues Cloudflare pages with %s pagination metadata', async metadata => {
+  it.each(['count', 'none'] as const)('paginates with %s metadata without inventing totals', async metadata => {
     logPageInfo = metadata;
-    remoteLogs = Array.from({ length: 60 }, (_, i) => logFixture({ id: `metadata-${i}`, created_at: new Date(Date.now() - i * 1000).toISOString() }));
-    await runSync();
-    expect(await admin('/logs')).toMatchObject({ total: 60 });
-    expect(controlCalls.some(call => new URL(call.url).pathname.endsWith('/logs') && new URL(call.url).searchParams.get('page') === '2')).toBe(true);
+    remoteLogs = Array.from({ length: 26 }, (_, i) => logFixture({ id: `metadata-${i}`, created_at: new Date(Date.now() - i * 1000).toISOString() }));
+    expect(await admin('/logs')).toMatchObject({ total: metadata === 'count' ? 26 : null, has_more: true });
+    expect(await admin('/logs?page=2')).toMatchObject({ total: metadata === 'count' ? 26 : null, has_more: false });
   });
-  it('accepts slightly future and expired upstream timestamps without remote date windows', async () => {
-    remoteLogs = [
-      logFixture({ id: 'clock-ahead', created_at: new Date(Date.now() + 120000).toISOString() }),
-      logFixture({ id: 'retained', created_at: new Date(Date.now() - 3 * 86400000).toISOString() }),
-      logFixture({ id: 'expired', created_at: '2000-01-01T00:00:00.000Z' }),
-    ];
-    await runSync();
-    expect(await admin('/logs/clock-ahead')).toMatchObject({ id: 'clock-ahead' });
-    expect(await admin('/logs/retained')).toMatchObject({ id: 'retained' });
-    expect(await db.prepare("SELECT id FROM observability_logs WHERE id = 'expired'").first()).toBeNull();
-    expect((await db.prepare("SELECT last_error FROM observability_jobs WHERE job LIKE 'logs:%'").all()).results).toEqual([
-      { last_error: null }, { last_error: null }, { last_error: null },
-    ]);
+  it('does not apply local retention or remote date windows to the live list', async () => {
+    remoteLogs = [logFixture({ id: 'clock-ahead', created_at: new Date(Date.now() + 120000).toISOString() }),
+      logFixture({ id: 'older', created_at: '2000-01-01T00:00:00.000Z' })];
+    controlCalls = [];
+    expect(await admin('/logs')).toMatchObject({ total: 2 });
+    expect(await admin('/logs/older')).toMatchObject({ id: 'older' });
+    const params = new URL(controlCalls[0].url).searchParams;
+    expect(params.has('start_date')).toBe(false); expect(params.has('end_date')).toBe(false); expect(params.has('filters')).toBe(false);
   });
-  it('filters by upstream model and success locally even when CF is unavailable', async () => {
+  it('delegates model/status/search filtering and totals to Cloudflare', async () => {
     remoteLogs = [logFixture(), logFixture({ id: 'failed', model: 'other-model', success: false, status_code: 500 })];
-    await runSync(); controlCalls = []; controlFailure = 503;
-    expect(await admin('/logs?status=error&model=other-model')).toMatchObject({ total: 1, storage: 'd1', data: [{ id: 'failed' }] });
-    expect(controlCalls).toEqual([]);
+    controlCalls = [];
+    expect(await admin('/logs?status=error&model=other-model&search=failed')).toMatchObject({ total: 1, data: [{ id: 'failed' }] });
+    expect(Object.fromEntries(new URL(controlCalls[0].url).searchParams)).toMatchObject({ success: 'false', model: 'other-model', search: 'failed' });
   });
-  it('serves log details from D1 without storing secret-bearing headers or request bodies', async () => {
+  it('reads fresh details without returning secret-bearing headers or request bodies', async () => {
     remoteLogs = [logFixture({ request_head: 'Authorization: secret' })];
-    await runSync(); controlCalls = []; controlFailure = 503;
-    const detail = await admin(`/logs/${remoteLogs[0].id}`); expect(detail).toMatchObject({ id: remoteLogs[0].id, source: 'cloudflare', storage: 'd1' }); expect(detail).not.toHaveProperty('request_head'); expect(JSON.stringify(detail)).not.toContain('Authorization');
-    expect(controlCalls).toEqual([]);
-    expect(JSON.stringify((await db.prepare('SELECT payload FROM observability_logs').all()).results)).not.toContain('Authorization');
+    controlCalls = [];
+    const detail = await admin(`/logs/${remoteLogs[0].id}`);
+    expect(detail).toMatchObject({ id: remoteLogs[0].id, source: 'cloudflare' });
+    expect(detail).not.toHaveProperty('request_head'); expect(detail).not.toHaveProperty('storage');
+    expect(JSON.stringify(detail)).not.toContain('Authorization');
+    remoteLogs[0].tokens_out = 999;
+    expect(await admin(`/logs/${remoteLogs[0].id}`)).toMatchObject({ output_tokens: 999 });
+    expect(controlCalls).toHaveLength(2);
+    remoteLogs = [];
+    expect((await request('/api/logs/cf-remote-log', { admin: true })).status).toBe(404);
   });
   it('does not fabricate missing status, tokens, or costs', async () => {
     remoteLogs = [logFixture({ status_code: undefined, tokens_in: null, tokens_out: null, cost: undefined, metadata: '{invalid' })];
-    await runSync();
-    const result = await admin<{ data: Record<string, unknown>[] }>('/logs'); expect(result.data[0]).toMatchObject({ status: null, input_tokens: null, output_tokens: null, cost_usd: null, key_name: '外部调用', model: 'cloud-model' });
+    const result = await admin<{ data: Record<string, unknown>[] }>('/logs');
+    expect(result.data[0]).toMatchObject({ status: null, input_tokens: null, output_tokens: null, cost_usd: null, key_name: '外部调用', model: 'cloud-model' });
   });
-  it('keeps GraphQL aggregates independent of local log totals and fixes the snapshot time window', async () => {
-    remoteLogs = [logFixture()]; await runSync();
-    const result = await admin('/stats?range=24h'); expect(result).toMatchObject({ source: 'cloudflare', storage: 'd1', scope: 'gateway', summary: { requests: 12345, successes: 12300, input_tokens: 500000, output_tokens: 100000, cost_usd: 4.25, cache_hits: 1000 } });
+  it('fetches live GraphQL aggregates and schema on every request without KV caching', async () => {
+    remoteLogs = [logFixture()]; controlCalls = [];
+    const result = await admin('/stats?range=24h');
+    expect(result).toMatchObject({ source: 'cloudflare', scope: 'gateway', summary: { requests: 12345, successes: 12300, input_tokens: 500000, output_tokens: 100000, cost_usd: 4.25, cache_hits: 1000 } });
     expect(result.window_end).toBeTruthy(); expect(result.window_start).toBeTruthy();
-    const query = String(controlCalls.find(call => String(call.body.query).includes('aiGatewayRequestsAdaptiveGroups'))?.body.query); expect(query).toContain('gateway: "test-gateway"'); expect(query).toContain(`accountTag: "${account}"`);
-    controlCalls = []; expect(await admin('/stats?range=24h')).toEqual(result); expect(controlCalls).toEqual([]);
+    expect(result).not.toHaveProperty('sync'); expect(result).not.toHaveProperty('storage');
+    const query = String(controlCalls.find(call => String(call.body.query).includes('aiGatewayRequestsAdaptiveGroups'))?.body.query);
+    expect(query).toContain('gateway: "test-gateway"'); expect(query).toContain(`accountTag: "${account}"`);
+    expect(controlCalls).toHaveLength(2);
+    await admin('/stats?range=7d'); expect(controlCalls).toHaveLength(4);
+    expect(controlCalls.filter(call => String(call.body.query).includes('__type'))).toHaveLength(2);
+    expect((await (await mf.getKVNamespace('KV')).list({ prefix: 'cf:analytics-schema:' })).keys).toEqual([]);
   });
-  it('distinguishes first-sync failure from zero and retains successful snapshots after failures', async () => {
-    controlCalls = [];
-    expect(await admin('/stats')).toMatchObject({ summary: null, synced_at: null, sync: { state: 'waiting' } });
-    expect(controlCalls).toHaveLength(0);
-    graphqlFailure = true; await runSync();
-    expect(await admin('/stats')).toMatchObject({ summary: null, sync: { state: 'error' } });
-    graphqlFailure = false; remoteLogs = [logFixture()]; await runSync(true);
-    const saved = await admin('/stats');
-    controlFailure = 503; await runSync(true);
-    expect(await admin('/stats')).toMatchObject({ summary: saved.summary, synced_at: saved.synced_at, window_end: saved.window_end, sync: { state: 'error', last_success_at: saved.synced_at } });
-    expect(await admin('/logs')).toMatchObject({ total: 1, sync: { state: 'error' } });
+  it.each(['/logs', '/logs/cf-remote-log', '/stats', '/channels/availability'])('retries 5xx twice for %s, then reports failure instead of stale data', async path => {
+    remoteLogs = [logFixture()]; await admin(path); controlCalls = []; controlStatuses = [502, 503];
+    await admin(path);
+    expect(controlCalls).toHaveLength(path === '/stats' ? 4 : 3);
+    controlCalls = []; controlFailure = 503;
+    const response = await request(`/api${path}`, { admin: true });
+    expect(response.status).toBe(502); expect(controlCalls).toHaveLength(3);
+    const result = await response.json(); expect(result).toMatchObject({ error: { code: 'cloudflare_api_error', message: expect.stringContaining('已重试 2 次') } });
+    expect(JSON.stringify(result)).not.toContain('sensitive Cloudflare response');
   });
-  it('persists and coalesces manual requests without performing work in the HTTP request', async () => {
-    controlCalls = [];
-    expect((await request('/api/observability/sync', { method: 'POST' })).status).toBe(401);
-    await Promise.all([admin('/observability/sync', {}, 'POST'), admin('/observability/sync', {}, 'POST')]);
-    expect(controlCalls).toEqual([]);
-    expect((await db.prepare('SELECT requested_seq, handled_seq FROM observability_jobs').all()).results.every(row => row.requested_seq === 1 && row.handled_seq === 0)).toBe(true);
-    await Promise.all([runSync(), runSync()]);
-    expect(controlCalls.filter(call => String(call.body.query).includes('aiGatewayRequestsAdaptiveGroups'))).toHaveLength(2);
-    controlCalls = []; await runSync(); expect(controlCalls).toHaveLength(0);
+  it('reports GraphQL errors without a fake zero-traffic response or extra retries', async () => {
+    graphqlFailure = true; controlCalls = [];
+    const response = await request('/api/stats', { admin: true });
+    expect(response.status).toBe(502); expect(controlCalls).toHaveLength(1);
+    expect(await response.json()).toMatchObject({ error: { code: 'cloudflare_analytics_error' } });
   });
-  it('checkpoints bounded log pages, resumes the failed page, and does not skip same-timestamp rows', async () => {
-    const stamp = new Date(Date.now() - 60000).toISOString();
-    remoteLogs = Array.from({ length: 260 }, (_, i) => logFixture({ id: `many-${String(i).padStart(4, '0')}`, created_at: stamp }));
-    await runSync(); expect(await admin('/logs')).toMatchObject({ total: 200 });
-    const before = await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:history'").first<{ cursor: string }>();
-    expect(JSON.parse(before!.cursor)).toMatchObject({ version: 2, scan: { page: 5 } });
-    logFailurePage = 5; await runSync(true);
-    const failed = await db.prepare("SELECT cursor, last_error FROM observability_jobs WHERE job = 'logs:history'").first<{ cursor: string; last_error: string }>();
-    expect(JSON.parse(failed!.cursor).scan).toMatchObject({ page: 5, started_at: JSON.parse(before!.cursor).scan.started_at });
-    expect(failed!.last_error).toBeTruthy();
-    expect(await admin('/logs')).toMatchObject({ total: 200 });
-    logFailurePage = 0; await runSync(true);
-    expect(await admin('/logs')).toMatchObject({ total: 260 });
-    await runSync(true); expect(await admin('/logs')).toMatchObject({ total: 260 });
-    expect(await db.prepare('SELECT COUNT(*) AS total, COUNT(DISTINCT id) AS unique_ids FROM observability_logs').first()).toEqual({ total: 260, unique_ids: 260 });
-    expect(await db.prepare("SELECT last_error FROM observability_jobs WHERE job = 'logs:history'").first()).toEqual({ last_error: null });
-  });
-  it('refreshes the head while overlapping continuation pages shifted by newly arrived logs', async () => {
-    const now = Date.now();
-    remoteLogs = Array.from({ length: 550 }, (_, i) => logFixture({ id: `existing-${String(i).padStart(4, '0')}`, created_at: new Date(now - (i + 1) * 1000).toISOString() }));
-    await runSync();
-    expect(await admin('/logs')).toMatchObject({ total: 200 });
-    remoteLogs.push(...Array.from({ length: 35 }, (_, i) => logFixture({ id: `arrival-${i}`, created_at: new Date(now + 1000 + i).toISOString() })));
-    controlCalls = [];
-    await runSync(true);
-    expect(await admin('/logs/arrival-34')).toMatchObject({ id: 'arrival-34' });
-    expect(controlCalls.some(call => new URL(call.url).pathname.endsWith('/logs') && new URL(call.url).searchParams.get('page') === '1')).toBe(true);
-    for (let i = 0; i < 4; i++) await runSync(true);
-    expect(await admin('/logs')).toMatchObject({ total: 585 });
-    expect(await db.prepare('SELECT COUNT(*) AS total, COUNT(DISTINCT id) AS unique_ids FROM observability_logs').first()).toEqual({ total: 585, unique_ids: 585 });
-    expect(await admin('/logs/existing-0549')).toMatchObject({ id: 'existing-0549' });
-    const history = await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:history'").first<{ cursor: string }>();
-    expect(JSON.parse(history!.cursor).covered_from).toBeTruthy();
-  });
-  it('restarts repeated upstream pages without advancing coverage or permanently retrying the same page', async () => {
-    const stamp = new Date(Date.now() - 60000).toISOString();
-    remoteLogs = Array.from({ length: 260 }, (_, i) => logFixture({ id: `repeat-${String(i).padStart(4, '0')}`, created_at: stamp }));
-    logRepeatFirstPage = true;
-    await runSync();
-    expect(await admin('/logs')).toMatchObject({ total: 50 });
-    const stalled = await db.prepare("SELECT cursor, last_error FROM observability_jobs WHERE job = 'logs:history'").first<{ cursor: string; last_error: string }>();
-    expect(JSON.parse(stalled!.cursor)).toMatchObject({ version: 2, scan: { page: 1 } });
-    expect(JSON.parse(stalled!.cursor).covered_from).toBeUndefined();
-    expect(stalled!.last_error).toBeTruthy();
-    expect(controlCalls.filter(call => new URL(call.url).pathname.endsWith('/logs')).length).toBeLessThanOrEqual(11);
-    logRepeatFirstPage = false; controlCalls = [];
-    await runSync(true); await runSync(true);
-    expect(await admin('/logs')).toMatchObject({ total: 260 });
-    expect(await db.prepare("SELECT last_error FROM observability_jobs WHERE job = 'logs:history'").first()).toEqual({ last_error: null });
-    const finished = await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:history'").first<{ cursor: string }>();
-    expect(JSON.parse(finished!.cursor).covered_from).toBeTruthy();
-  });
-  it('restarts an out-of-range continuation after the remote list shrinks instead of claiming full coverage', async () => {
-    await runSync();
-    const now = Date.now();
-    remoteLogs = Array.from({ length: 250 }, (_, i) => logFixture({ id: `shortened-${String(i).padStart(4, '0')}`, created_at: new Date(now - i * 1000).toISOString() }));
-    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify({ version: 2,
-      scan: { page: 21, started_at: new Date(now - 3600000).toISOString(), stop_before: new Date(now - 7 * 86400000).toISOString() },
-    })).run();
-    controlCalls = [];
-    await runSync(true);
-    const resumed = await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:history'").first<{ cursor: string }>();
-    const cursor = JSON.parse(resumed!.cursor);
-    expect(cursor.scan).toBeTruthy();
-    expect(cursor.scan.page).toBeLessThanOrEqual(5);
-    expect(cursor.covered_from).toBeUndefined();
-    expect((await request('/api/logs/shortened-0225', { admin: true })).status).toBe(404);
-    expect(controlCalls.some(call => new URL(call.url).pathname.endsWith('/logs') && new URL(call.url).searchParams.get('page') === '20')).toBe(true);
-    await runSync(true);
-    expect(await admin('/logs/shortened-0225')).toMatchObject({ id: 'shortened-0225' });
-    expect(await admin('/logs')).toMatchObject({ total: 250 });
-  });
-  it('upgrades obsolete window cursors and clears their errors without deleting cached logs', async () => {
-    remoteLogs = [logFixture({ id: 'cached-before-upgrade' })];
-    await runSync();
-    const legacy = { window: { page: 99, start: '2000-01-01T00:00:00.000Z', end: '2000-01-02T00:00:00.000Z', kind: 'backfill' },
-      covered_from: '2000-01-01T00:00:00.000Z', covered_to: '2000-01-02T00:00:00.000Z' };
-    await db.prepare("UPDATE observability_jobs SET cursor = ?, last_error = 'Cloudflare 返回了时间范围之外的日志，同步进度已保留' WHERE job LIKE 'logs:%'").bind(JSON.stringify(legacy)).run();
-    remoteLogs = [logFixture({ id: 'after-upgrade' })]; controlCalls = [];
-    await runSync(true);
-    expect(await admin('/logs')).toMatchObject({ total: 2 });
-    expect(await admin('/logs/cached-before-upgrade')).toMatchObject({ id: 'cached-before-upgrade' });
-    for (const row of (await db.prepare("SELECT cursor, last_error FROM observability_jobs WHERE job LIKE 'logs:%'").all<{ cursor: string; last_error: string | null }>()).results) {
-      expect(JSON.parse(row.cursor)).toMatchObject({ version: 2 });
-      expect(JSON.parse(row.cursor)).not.toHaveProperty('window');
-      expect(row.last_error).toBeNull();
+  it('removes sync endpoints and cache tables; scheduled cleanup never fetches Cloudflare', async () => {
+    for (const [path, method] of [['/observability', 'GET'], ['/observability/sync', 'POST'], ['/config/observability', 'PUT']]) {
+      expect((await request(`/api${path}`, { admin: true, method })).status).toBe(404);
     }
-    expect(controlCalls.filter(call => new URL(call.url).pathname.endsWith('/logs')).every(call => new URL(call.url).searchParams.get('page') === '1')).toBe(true);
-  });
-  it('revisits SSE usage beyond the head page budget while keeping distinct attempts of one request', async () => {
-    const pending = logFixture({ id: 'attempt-1', created_at: new Date(Date.now() - 90 * 60000).toISOString(), tokens_out: null });
-    remoteLogs = [pending, logFixture({ id: 'attempt-2' }), ...Array.from({ length: 320 }, (_, i) => logFixture({ id: `sse-newer-${i}`, created_at: new Date(Date.now() - (i + 1) * 1000).toISOString() }))];
-    await runSync(); await runSync(true);
-    expect(await admin('/logs')).toMatchObject({ total: 322 });
-    expect(await admin('/logs/attempt-1')).toMatchObject({ output_tokens: null });
-    pending.tokens_out = 1234; pending.duration = 3600000;
-    for (let i = 0; i < 3; i++) await runSync(true);
-    expect(await admin('/logs/attempt-1')).toMatchObject({ output_tokens: 1234, latency_ms: 3600000 });
-    expect(await admin('/logs/attempt-2')).toMatchObject({ request_id: 'edge-request', id: 'attempt-2' });
-    expect(await admin('/logs')).toMatchObject({ total: 322 });
-  });
-  it('backfills outage gaps and expanded retention, and immediately hides expired rows', async () => {
-    await runSync();
-    const cursor = { version: 2, covered_from: new Date(Date.now() - 7 * 86400000).toISOString(), covered_to: new Date(Date.now() - 4 * 3600000).toISOString() };
-    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify(cursor)).run();
-    remoteLogs = [logFixture({ id: 'outage', created_at: new Date(Date.now() - 3 * 3600000).toISOString() })];
-    await runSync(true); expect(await admin('/logs/outage')).toMatchObject({ id: 'outage' });
-    remoteLogs.push(logFixture({ id: 'older', created_at: new Date(Date.now() - 7.5 * 86400000).toISOString() }));
-    await admin('/config/observability', { log_retention_days: 30 }, 'PUT');
-    await runSync(true);
-    expect(await admin('/logs/older')).toMatchObject({ id: 'older' });
-    await db.prepare("UPDATE observability_jobs SET cursor = ? WHERE job = 'logs:history'").bind(JSON.stringify({ version: 2, covered_from: new Date(Date.now() - 30 * 86400000).toISOString(), covered_to: new Date().toISOString() })).run();
-    await admin('/config/observability', { log_retention_days: 7 }, 'PUT');
-    expect((await request('/api/logs/older', { admin: true })).status).toBe(404);
-    expect(await admin('/logs')).toMatchObject({ total: 1 });
-    await runSync(); expect(await db.prepare("SELECT id FROM observability_logs WHERE id = 'older'").first()).toBeNull();
-    await admin('/config/observability', { log_retention_days: 30 }, 'PUT');
-    expect(await db.prepare("SELECT cursor FROM observability_jobs WHERE job = 'logs:history'").first()).toEqual({ cursor: null });
-    await runSync(true);
-    expect(await admin('/logs/older')).toMatchObject({ id: 'older' });
-    expect((await request('/api/config/observability', { admin: true, method: 'PUT', body: { log_retention_days: 100 } })).status).toBe(400);
-  });
-  it('does not overwrite newer observed SSE usage with an older in-flight observation', async () => {
-    remoteLogs = [logFixture()]; await runSync();
-    const cached = await admin('/logs/cf-remote-log');
-    // A later request has already committed while the next tested observation is older.
-    await db.prepare('UPDATE observability_logs SET observed_at = ?, payload = ? WHERE id = ?').bind(Date.now() + 60000, JSON.stringify({ ...cached, output_tokens: 9999 }), 'cf-remote-log').run();
-    remoteLogs[0].tokens_out = 1;
-    await runSync(true);
-    expect(await admin('/logs/cf-remote-log')).toMatchObject({ output_tokens: 9999 });
-  });
-  it('fetches the newest records first when head synchronization exceeds its page budget', async () => {
-    const now = Date.now();
-    remoteLogs = Array.from({ length: 240 }, (_, i) => logFixture({ id: `newest-${i}`, created_at: new Date(now - i * 1000).toISOString() }));
-    await runSync();
-    const result = await admin<{ total: number; data: { id: string }[] }>('/logs');
-    expect(result.total).toBe(200); expect(result.data[0].id).toBe('newest-0');
-    expect((await request('/api/logs/newest-239', { admin: true })).status).toBe(404);
-  });
-  it('isolates account/gateway caches and does not read or modify legacy logs', async () => {
+    expect((await db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'observability_%'").all()).results).toEqual([]);
     await db.prepare("INSERT INTO request_logs (id,key_id,model,status,latency_ms) VALUES ('legacy','old','old-model',200,3)").run();
-    await db.prepare('INSERT INTO observability_logs (scope, id, created_at, success, upstream_model, payload, synced_at) VALUES (?, ?, ?, 1, ?, ?, ?)').bind('another-gateway', 'external', new Date().toISOString(), 'secret-model', '{}', new Date().toISOString()).run();
-    expect(await admin('/logs')).toMatchObject({ total: 0 }); await chat((await key()).key);
-    expect(await db.prepare('SELECT COUNT(*) AS n FROM request_logs').first()).toMatchObject({ n: 1 });
+    controlCalls = [];
+    const result = await (await mf.getWorker()).scheduled({ cron: '15 3 * * *', scheduledTime: new Date('2026-09-13T03:15:00Z') });
+    expect(result.outcome).toBe('ok'); expect(controlCalls).toHaveLength(0);
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM request_logs').first()).toEqual({ n: 1 });
   });
 });
 
@@ -1324,7 +1143,7 @@ describe('upstream error disclosure and administrator traces', () => {
     expect(trace).toHaveLength(1); expect(trace[0]).toMatchObject({ request_id: requestId, attempt: 1, error_body: original, error_code: 'quota_exceeded', status: 400, cf_log_id: 'cf-log-1' });
     expect(JSON.stringify(trace)).not.toContain('provider-header-secret'); expect(JSON.stringify(trace)).not.toContain('private prompt');
     expect((await request(`/api/traces/${requestId}`, { key: token })).status).toBe(401);
-    remoteLogs = [logFixture({ id: 'cf-log-1' })]; await runSync();
+    remoteLogs = [logFixture({ id: 'cf-log-1' })];
     expect(await admin('/logs/cf-log-1')).toMatchObject({ upstream_error: { error_body: original } });
   });
   it('matches HTTP status rules and hides unmatched errors without replacing unrelated gateway errors', async () => {

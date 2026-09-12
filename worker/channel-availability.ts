@@ -1,29 +1,16 @@
 import type { Context } from 'hono';
 import type { AppEnv, Env } from './types';
-import { jobStatus, observabilityScope, readLogCursor, type SyncRow } from './observability-store';
+import { fetchLogPage } from './cloudflare-observability';
+import { ApiError } from './lib/errors';
 import { CHANNEL_AVAILABILITY_WINDOW_MS, CHANNEL_AVAILABILITY_BUCKET_MS, CHANNEL_AVAILABILITY_BUCKET_COUNT, type ChannelAvailability, type ChannelAvailabilityResponse } from '../shared/observability';
 
-interface BucketRow { channel_id: string; bucket: number; requests: number; successes: number }
+const MAX_PAGES = 40;
+const READ_TIMEOUT_MS = 10_000;
+const TIMEOUT_WARNING = 'Cloudflare 日志读取已达到时间上限，当前仅展示已读取的样本。';
 
 export async function getChannelAvailability(env: Env, now = Date.now()): Promise<ChannelAvailabilityResponse> {
   const end = Math.floor(now / 1000) * 1000, start = end - CHANNEL_AVAILABILITY_WINDOW_MS;
-  const window_start = new Date(start).toISOString(), window_end = new Date(end).toISOString();
-  const scope = observabilityScope(env);
-  const [channels, rows, jobs] = await Promise.all([
-    env.DB.prepare('SELECT id FROM channels').all<{ id: string }>(),
-    // One indexed one-hour scan for every channel. Never infer identity from names:
-    // renamed channels and channels sharing a provider must remain separate.
-    env.DB.prepare(`SELECT json_extract(payload, '$.channel_id') AS channel_id,
-      CAST((unixepoch(created_at) - ?) / ? AS INTEGER) AS bucket,
-      COUNT(*) AS requests, SUM(CASE WHEN json_extract(payload, '$.success') = 1 THEN 1 ELSE 0 END) AS successes
-      FROM observability_logs
-      WHERE scope = ? AND created_at >= ? AND created_at < ?
-        AND json_type(payload, '$.success') IN ('true', 'false')
-        AND COALESCE(json_extract(payload, '$.cached'), 0) = 0
-        AND json_extract(payload, '$.channel_id') IN (SELECT id FROM channels)
-      GROUP BY channel_id, bucket`).bind(start / 1000, CHANNEL_AVAILABILITY_BUCKET_MS / 1000, scope, window_start, window_end).all<BucketRow>(),
-    env.DB.prepare("SELECT * FROM observability_jobs WHERE scope = ? AND job IN ('logs:head', 'logs:repair', 'logs:history')").bind(scope).all<SyncRow>(),
-  ]);
+  const channels = await env.DB.prepare('SELECT id FROM channels').all<{ id: string }>();
   const byChannel = new Map<string, ChannelAvailability>(channels.results.map(channel => [channel.id, {
     channel_id: channel.id, requests: 0, successes: 0, rate: null,
     buckets: Array.from({ length: CHANNEL_AVAILABILITY_BUCKET_COUNT }, (_, i) => ({
@@ -31,31 +18,73 @@ export async function getChannelAvailability(env: Env, now = Date.now()): Promis
       requests: 0, successes: 0, rate: null,
     })),
   }]));
-  for (const row of rows.results) {
-    const channel = byChannel.get(row.channel_id), bucket = channel?.buckets[row.bucket];
-    if (!channel || !bucket) continue;
-    Object.assign(bucket, { requests: row.requests, successes: row.successes, rate: row.successes / row.requests });
-    channel.requests += row.requests;
-    channel.successes += row.successes;
+
+  // Read one global descending stream for every channel. Live pagination can
+  // overlap when new requests arrive, so each Cloudflare log ID counts once.
+  const seen = new Set<string>();
+  let sampledLogs = 0, completedPages = 0;
+  let coverage: ChannelAvailabilityResponse['coverage'] = 'partial';
+  let warning: string | undefined;
+  const controller = new AbortController(), deadline = Date.now() + READ_TIMEOUT_MS;
+  const timeout = setTimeout(() => controller.abort(), READ_TIMEOUT_MS);
+  try {
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      if (controller.signal.aborted || Date.now() >= deadline) {
+        warning = TIMEOUT_WARNING;
+        break;
+      }
+      let result: Awaited<ReturnType<typeof fetchLogPage>>;
+      try {
+        result = await fetchLogPage(env, page, { signal: controller.signal });
+      } catch (error) {
+        // A failed first read must remain an error, never an empty report.
+        if (!completedPages) {
+          if (controller.signal.aborted) throw new ApiError(504, 'cloudflare_timeout', 'Cloudflare 日志读取超时');
+          throw error;
+        }
+        warning = controller.signal.aborted ? TIMEOUT_WARNING : '读取后续 Cloudflare 日志失败，当前仅展示已读取的样本。';
+        break;
+      }
+      completedPages++;
+      let reachedStart = false, newLogs = 0;
+      for (const log of result.logs) {
+        const time = Date.parse(log.created_at);
+        if (time < start) reachedStart = true;
+        if (seen.has(log.id)) continue;
+        seen.add(log.id);
+        newLogs++;
+        if (time < start || time >= end || typeof log.success !== 'boolean' || log.cached !== 0) continue;
+        // Stable IDs survive channel renames and distinguish shared providers.
+        const channel = log.channel_id ? byChannel.get(log.channel_id) : undefined;
+        const bucket = channel?.buckets[Math.floor((time - start) / CHANNEL_AVAILABILITY_BUCKET_MS)];
+        if (!channel || !bucket) continue;
+        sampledLogs++;
+        channel.requests++;
+        bucket.requests++;
+        if (log.success) { channel.successes++; bucket.successes++; }
+      }
+      if (reachedStart || !result.has_more) {
+        coverage = 'complete';
+        break;
+      }
+      if (!newLogs) {
+        warning = 'Cloudflare 日志分页未返回新记录，当前仅展示已读取的样本。';
+        break;
+      }
+      if (page === MAX_PAGES) warning = '本次已达到 Cloudflare 日志分页上限，当前仅展示已读取的样本。';
+    }
+  } finally {
+    clearTimeout(timeout);
   }
-  for (const channel of byChannel.values()) channel.rate = channel.requests ? channel.successes / channel.requests : null;
-  const head = jobs.results.find(row => row.job === 'logs:head');
-  const repair = jobs.results.find(row => row.job === 'logs:repair');
-  const history = jobs.results.find(row => row.job === 'logs:history');
-  // Either a recent repair pass or a historical pass can have read this hour.
-  // Starting another background sweep must not hide a recently finished pass.
-  const scanned = [repair, history].some(row => {
-    const cursor = readLogCursor(row?.cursor);
-    return cursor.covered_from && cursor.covered_from <= window_start
-      && cursor.covered_to && Date.parse(cursor.covered_to) >= end - 10 * 60000;
-  });
-  const result: ChannelAvailabilityResponse = {
-    data: [...byChannel.values()], window_start, window_end, storage: 'd1', source: 'cloudflare',
-    sync: jobStatus('logs:head', head),
-    jobs: [jobStatus('logs:head', head), jobStatus('logs:repair', repair), jobStatus('logs:history', history)],
-    backfilling: !head?.last_success_at || !scanned,
+  for (const channel of byChannel.values()) {
+    channel.rate = channel.requests ? channel.successes / channel.requests : null;
+    for (const bucket of channel.buckets) bucket.rate = bucket.requests ? bucket.successes / bucket.requests : null;
+  }
+  return {
+    data: [...byChannel.values()], window_start: new Date(start).toISOString(), window_end: new Date(end).toISOString(),
+    source: 'cloudflare', coverage, sampled_logs: sampledLogs, fetched_at: new Date().toISOString(),
+    ...(warning ? { warning } : {}),
   };
-  return result;
 }
 
 export async function channelAvailability(c: Context<AppEnv>) {

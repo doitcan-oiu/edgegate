@@ -7,7 +7,6 @@ import { checkOrigin, login, logout, requireAdmin } from './auth';
 import { admin } from './admin';
 import { chat, listModels } from './gateway';
 import { ERROR_RETENTION_DAYS } from './upstream-errors';
-import { cleanObservabilityLogs, syncObservability } from './observability-sync';
 
 const app = new Hono<AppEnv>();
 app.use('*', async (c, next) => {
@@ -51,8 +50,6 @@ app.onError((error, c) => {
 export default {
   fetch: app.fetch,
   async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
-    ctx.waitUntil(syncObservability(env));
-    ctx.waitUntil(cleanObservabilityLogs(env));
     if (new Date(event.scheduledTime).getUTCHours() === 3 && new Date(event.scheduledTime).getUTCMinutes() === 15) {
       ctx.waitUntil(env.DB.prepare('DELETE FROM key_counters WHERE day < ?').bind(Math.floor(Date.now() / 86400000) - 2).run());
       ctx.waitUntil(env.DB.prepare('DELETE FROM upstream_error_traces WHERE created_at < ?').bind(new Date(Date.now() - ERROR_RETENTION_DAYS * 86400000).toISOString()).run());

@@ -180,7 +180,7 @@ export function Channels() {
         </aside>
         <section className="channels-directory" aria-label="渠道列表">
           <div className="channels-toolbar"><div className="channels-section-title"><h2>{viewLabels[view]}</h2><span>{filtered?.length ?? '—'}</span></div><div className="channels-search"><Search size={17} /><Input aria-label="搜索渠道" placeholder="搜索名称、地址或标签" value={search} onChange={e => { setSearch(e.target.value); setPage(1); }} />{search && <Button type="button" variant="ghost" className="icon-btn" aria-label="清除搜索" onClick={() => { setSearch(''); setPage(1); }}><X size={14} /></Button>}</div></div>
-          <ErrorBox message={error} />
+          <ErrorBox message={error} /><ErrorBox message={availability.error ? `渠道可用率读取失败：${availability.error}` : ''} onRetry={availability.reload} />
           {loading && !data ? <Loading /> : error && !data ? null : !visibleChannels?.length ? <Empty title={hasFilters ? '没有找到匹配的渠道' : '添加第一个渠道'} description={hasFilters ? '试试其他关键词，或清除当前筛选。' : '接入服务商后，在这里统一管理模型与连接。'} action={hasFilters ? <Button variant="secondary" onClick={clearFilters}>清除筛选</Button> : <Button onClick={() => setEditing(null)}><Plus size={17} />添加渠道</Button>} /> : <>
             <div ref={directoryScroll} className="channels-entries" role="region" aria-label="供应商渠道" tabIndex={0}>{visibleChannels.map(channel => <ChannelEntry key={channel.id} channel={channel} availability={availabilityByChannel.get(channel.id)} availabilityData={availability.data} availabilityLoading={availability.loading} availabilityError={availability.error} onEdit={setEditing} onDelete={() => { setDeleting(channel); setDeleteError(''); }} />)}</div>
           <footer className="channels-pagination">
@@ -190,7 +190,7 @@ export function Channels() {
           </>}
         </section>
       </div>
-      <footer className="channels-footnote"><p>可用率按已同步的非缓存请求统计，非实时探测。每块 2 分钟，灰色表示无有效记录，悬停查看详情。</p><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">AI Gateway 接入文档<ArrowUpRight size={14} /></a></footer>
+      <footer className="channels-footnote"><p>{!availability.loading && !availability.error && availability.data?.coverage === 'partial' && <><strong>本次可用率样本不完整。</strong>{availability.data.warning} </>}可用率按本次从 Cloudflare 读取的非缓存请求样本统计，非实时探测。每块 2 分钟，灰色表示样本中无有效记录；样本不完整时会标明，悬停查看原因和读取时间。</p><a className="text-link" href="https://developers.cloudflare.com/ai-gateway/configuration/custom-providers/" target="_blank" rel="noreferrer">AI Gateway 接入文档<ArrowUpRight size={14} /></a></footer>
     </div>
     {editing !== undefined && <ChannelForm channel={editing} onClose={() => setEditing(undefined)} />}
     {deleting && <Confirm title={`删除本地渠道 ${deleting.name}？`} description="此渠道、加密保存的密钥及其模型路由会被移除。Cloudflare 的服务商、已有 BYOK 密钥与日志会保留。" onConfirm={remove} onClose={() => setDeleting(null)} busy={busy} error={deleteError} />}

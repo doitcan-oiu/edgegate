@@ -1,4 +1,4 @@
-import { createContext, useContext, useEffect, useState } from 'react';
+import { createContext, useCallback, useContext, useEffect, useState } from 'react';
 
 export async function api<T = { ok: boolean }>(path: string, options: RequestInit = {}): Promise<T> {
   const response = await fetch(`/api${path}`, { ...options, credentials: 'same-origin', headers: { ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers } });
@@ -13,6 +13,8 @@ export const RefreshContext = createContext({ version: 0, refresh: () => {} });
 export const ToastContext = createContext<(message: string) => void>(() => {});
 export function useApi<T>(path: string) {
   const { version } = useContext(RefreshContext);
+  const [retryVersion, setRetryVersion] = useState(0);
+  const reload = useCallback(() => setRetryVersion(value => value + 1), []);
   const [data, setData] = useState<T | null>(null), [error, setError] = useState(''), [loading, setLoading] = useState(true);
   useEffect(() => {
     const controller = new AbortController();
@@ -21,8 +23,8 @@ export function useApi<T>(path: string) {
       .catch(err => { if (!controller.signal.aborted) setError(err.message); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [path, version]);
-  return { data, error, loading };
+  }, [path, version, retryVersion]);
+  return { data, error, loading, reload };
 }
 export const number = (value: number) => new Intl.NumberFormat('zh-CN').format(Math.round(value));
 export const compact = (value: number) => new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 }).format(value);

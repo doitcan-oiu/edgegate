@@ -1,12 +1,11 @@
-import { ObservabilitySync } from '../ObservabilitySync';
 import { useContext, useState } from 'react';
-import { Activity, ArrowRight, Check, ChevronRight, Cloud, Copy, GitBranch, KeyRound, Radio, Terminal } from 'lucide-react';
+import { Activity, ArrowRight, Check, ChevronRight, Cloud, Copy, GitBranch, KeyRound, Radio, RefreshCw, Terminal } from 'lucide-react';
 import { useApi, number, compact, money, copy, ToastContext } from '../lib';
 import type { Stats, Channel, ApiKey, Model, LogPage, Log, Config } from '../types';
 import { Badge, Button, Empty, ErrorBox, Loading, LogDetail, LogTable, PageTitle, Select } from '../components';
 
 function TrafficChart({ stats }: { stats: Stats | null }) {
-  if (!stats?.summary || !stats.window_end) return <div className="chart-offline"><Activity size={20} aria-hidden="true" /><strong>等待网关数据</strong><p>后台同步成功后，这里会显示请求趋势。</p><a href="#settings" className="text-link">查看同步设置<ArrowRight size={15} /></a></div>;
+  if (!stats?.summary || !stats.window_end) return <div className="chart-offline"><Activity size={20} aria-hidden="true" /><strong>等待网关数据</strong><p>从 Cloudflare 读取成功后，这里会显示请求趋势。</p><a href="#settings" className="text-link">检查网关连接<ArrowRight size={15} /></a></div>;
   const hourly = stats.range === '24h', step = hourly ? 3600000 : 86400000, count = hourly ? 25 : 8;
   const end = Math.floor(Date.parse(stats.window_end) / step) * step;
   const bins = Array.from({ length: count }, (_, index) => {
@@ -27,7 +26,9 @@ function TrafficChart({ stats }: { stats: Stats | null }) {
 export function Dashboard() {
   const [range, setRange] = useState('24h'), [selected, setSelected] = useState<Log | null>(null);
   const stats = useApi<Stats>(`/stats?range=${range}`), channels = useApi<Channel[]>('/channels'), models = useApi<Model[]>('/models'), keys = useApi<ApiKey[]>('/keys'), logs = useApi<LogPage>('/logs'), config = useApi<Config>('/config');
-  const notify = useContext(ToastContext), base = `${location.origin}/v1`, summary = stats.data?.summary;
+  const notify = useContext(ToastContext), base = `${location.origin}/v1`;
+  const currentStats = !stats.loading && !stats.error ? stats.data : null, currentLogs = !logs.loading && !logs.error ? logs.data : null, summary = currentStats?.summary;
+  const reload = () => { stats.reload(); logs.reload(); };
   const setupRequired = !!config.data && (!config.data.account_id || !config.data.gateway_id || !config.data.control_token_configured);
   const readyChannels = channels.data?.filter(channel => channel.enabled && channel.configured).length || 0;
   const activeKeys = keys.data?.filter(key => !key.revoked_at && (!key.expires_at || Date.parse(key.expires_at) > Date.now())).length || 0;
@@ -43,23 +44,22 @@ export function Dashboard() {
     { label: '调用费用', value: money(summary?.cost_usd ?? null), note: 'Cloudflare 费用统计' },
   ];
   return <>
-    <PageTitle title="运行总览" description="查看网关流量、调用用量与资源状态。" action={<><Select aria-label="统计时间范围" value={range} onChange={setRange}><option value="24h">过去 24 小时</option><option value="7d">过去 7 天</option></Select><a href="#playground" className="btn btn-primary"><Terminal size={17} />发起请求</a></>} />
-    <ErrorBox message={channels.error || models.error || keys.error || config.error} />{!setupRequired && [...new Set([stats.error, logs.error].filter(Boolean))].map(message => <ErrorBox key={message} message={message} />)}
-    <ObservabilitySync jobs={[range === '7d' ? 'stats:7d' : 'stats:24h', 'logs:head']} />
+    <PageTitle title="运行总览" description="查看网关流量、调用用量与资源状态。" action={<><Select aria-label="统计时间范围" value={range} onChange={setRange}><option value="24h">过去 24 小时</option><option value="7d">过去 7 天</option></Select><Button variant="secondary" disabled={stats.loading || logs.loading} onClick={reload}><RefreshCw size={16} />刷新</Button><a href="#playground" className="btn btn-primary"><Terminal size={17} />发起请求</a></>} />
+    <ErrorBox message={channels.error || models.error || keys.error || config.error} />
     <section className="traffic-workspace surface">
-      <div className="traffic-main"><div className="request-volume"><span className="metric-label">总请求量</span><strong className="volume-number">{summary ? number(summary.requests) : '—'}</strong><span className="muted">{range === '24h' ? '过去 24 小时' : '过去 7 天'} · 上游请求</span><div className="volume-tokens"><span>Token 总量</span><strong>{summary?.input_tokens != null && summary.output_tokens != null ? compact(summary.input_tokens + summary.output_tokens) : '—'}</strong></div><Badge tone={setupRequired ? 'amber' : summary ? 'green' : 'neutral'}>{setupRequired ? '等待接入' : summary ? '缓存数据' : '等待数据'}</Badge></div>
-      <div className="traffic-visual"><div className="surface-heading"><h2>请求趋势</h2><div className="chart-legend"><span><i />请求量</span><span><i className="amber" />错误</span></div></div>{stats.loading && !stats.data ? <Loading /> : <TrafficChart stats={stats.data} />}</div></div>
+      <div className="traffic-main"><div className="request-volume"><span className="metric-label">总请求量</span><strong className="volume-number">{summary ? number(summary.requests) : '—'}</strong><span className="muted">{range === '24h' ? '过去 24 小时' : '过去 7 天'} · 上游请求</span><div className="volume-tokens"><span>Token 总量</span><strong>{summary?.input_tokens != null && summary.output_tokens != null ? compact(summary.input_tokens + summary.output_tokens) : '—'}</strong></div><Badge tone={setupRequired ? 'amber' : stats.error ? 'red' : summary ? 'green' : 'neutral'}>{setupRequired ? '等待接入' : stats.error ? '读取失败' : stats.loading ? '读取中' : 'Cloudflare 数据'}</Badge></div>
+      <div className="traffic-visual"><div className="surface-heading"><h2>请求趋势</h2><div className="chart-legend"><span><i />请求量</span><span><i className="amber" />错误</span></div></div>{stats.loading ? <Loading /> : stats.error ? <ErrorBox message={stats.error} onRetry={stats.reload} /> : <TrafficChart stats={currentStats} />}</div></div>
       <div className="metric-rail">{metrics.map(({ label, value, note }) => <div key={label}><div><span>{label}</span><strong>{value}</strong></div><small>{note}</small></div>)}</div>
     </section>
     <div className="overview-secondary">
       <section className="surface model-ranking"><div className="surface-heading"><div><h2>模型流量排名</h2></div><a className="text-link" href="#models">模型管理<ArrowRight size={16} /></a></div>
-        {stats.data?.models.length ? <div className="rank-list">{stats.data.models.map((model, index) => <div className="rank-row" key={model.model}><span className="rank-number">{String(index + 1).padStart(2, '0')}</span><div><div className="rank-name"><code>{model.model}</code><strong>{number(model.requests)}<small>请求</small></strong></div><div className="rank-track"><i style={{ width: `${Math.min(100, model.requests / Math.max(1, stats.data!.summary!.requests) * 100)}%` }} /></div></div></div>)}</div> : <Empty title={summary ? '还没有模型调用' : '等待统计同步'} description={summary ? '发起第一次请求后，这里将显示各模型的调用分布。' : '首次同步成功后显示模型调用分布。'} action={<a href="#playground" className="text-link">打开 Playground<ArrowRight size={15} /></a>} />}
+        {stats.loading ? <Loading /> : stats.error ? <p className="page-footnote">统计读取失败，重试后可查看模型分布。</p> : currentStats?.models.length ? <div className="rank-list">{currentStats.models.map((model, index) => <div className="rank-row" key={model.model}><span className="rank-number">{String(index + 1).padStart(2, '0')}</span><div><div className="rank-name"><code>{model.model}</code><strong>{number(model.requests)}<small>请求</small></strong></div><div className="rank-track"><i style={{ width: `${Math.min(100, model.requests / Math.max(1, currentStats.summary!.requests) * 100)}%` }} /></div></div></div>)}</div> : <Empty title="还没有模型调用" description="此时间范围内未返回模型调用。发起请求后刷新查看调用分布。" action={<a href="#playground" className="text-link">打开 Playground<ArrowRight size={15} /></a>} />}
       </section>
       <section className="surface readiness"><div className="surface-heading"><div><h2>接入检查</h2></div><span className="count-badge">{steps.filter(step => step.done).length} / 4</span></div><div className="readiness-list">{steps.map(({ label, detail, done, href, icon: Icon }) => <a href={href} key={label} className={done ? 'done' : ''}><span className="readiness-icon">{done ? <Check size={17} /> : <Icon size={18} />}</span><div><strong>{label}</strong><span>{detail}</span></div><ChevronRight size={16} /></a>)}</div></section>
     </div>
-    <section className="surface recent-requests"><div className="surface-heading"><div className="inline-heading"><h2>最近请求</h2><Badge>{logs.data?.total ?? '—'} 条</Badge></div><a href="#logs" className="text-link">全部日志<ArrowRight size={16} /></a></div>{logs.data?.data.length ? <LogTable logs={logs.data.data.slice(0, 5)} onSelect={setSelected} /> : logs.loading ? <Loading /> : <Empty title={setupRequired ? '连接网关后查看请求日志' : logs.error ? '暂时无法读取日志' : !logs.data?.sync.last_success_at ? '等待首次日志同步' : '暂无已同步日志'} description="页面读取已同步日志；首次同步与历史回补需要一些时间。" />}</section>
+    <section className="surface recent-requests"><div className="surface-heading"><div className="inline-heading"><h2>最近请求</h2><Badge>{currentLogs?.total ?? '—'} 条</Badge></div><a href="#logs" className="text-link">全部日志<ArrowRight size={16} /></a></div>{logs.loading ? <Loading /> : logs.error ? <ErrorBox message={logs.error} onRetry={logs.reload} /> : currentLogs?.data.length ? <LogTable logs={currentLogs.data.slice(0, 5)} onSelect={setSelected} /> : <Empty title={setupRequired ? '连接网关后查看请求日志' : '暂无请求日志'} description="每次刷新直接读取 Cloudflare；新请求的日志可能稍后出现。" />}</section>
     <section className="endpoint-strip"><Terminal size={17} aria-hidden="true" /><div><strong>应用接入地址</strong><code>{base}</code></div><Button variant="secondary" onClick={() => copy(base, notify)}><Copy size={16} />复制端点</Button><a href="#settings" className="text-link">接入文档<ArrowRight size={16} /></a></section>
-    <p className="page-footnote">统计范围为当前 AI Gateway 的全部请求，包含其他客户端与故障转移尝试。图表按缓存快照的统计时间绘制；Cloudflare 分析数据可能延迟或采样。</p>
+    <p className="page-footnote">统计范围为当前 AI Gateway 的全部请求，包含其他客户端与故障转移尝试。每次刷新直接读取 Cloudflare，图表按返回的统计时间窗口绘制；分析数据可能延迟或采样。</p>
     {selected && <LogDetail log={selected} onClose={() => setSelected(null)} />}
   </>;
 }

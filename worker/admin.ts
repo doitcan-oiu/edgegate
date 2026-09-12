@@ -9,7 +9,6 @@ import { channelAvailability } from './channel-availability';
 import { getGatewaySettings, saveGatewaySettings } from './settings';
 import { getErrorTraces } from './upstream-errors';
 import { checkRouteScope, readRouteScope, requireGlobalModelScope, scopeCondition } from './route-scope';
-import { getObservabilityStatus, requestObservabilitySync, saveObservabilitySettings } from './observability-store';
 
 export const admin = new Hono<AppEnv>();
 admin.get('/config', async c => c.json({
@@ -22,9 +21,6 @@ admin.get('/config', async c => c.json({
   dashboard_url: `https://dash.cloudflare.com/${c.env.CLOUDFLARE_ACCOUNT_ID || ''}/ai/ai-gateway`,
 }));
 admin.put('/config/runtime', async c => c.json(await saveGatewaySettings(c.env, await c.req.json())));
-admin.get('/observability', async c => c.json(await getObservabilityStatus(c.env)));
-admin.post('/observability/sync', async c => c.json(await requestObservabilitySync(c.env), 202));
-admin.put('/config/observability', async c => c.json(await saveObservabilitySettings(c.env, await c.req.json())));
 admin.get('/traces/:requestId', async c => {
   const requestId = c.req.param('requestId');
   if (!/^[a-f0-9-]{36}$/i.test(requestId)) throw invalid('请输入有效的 EdgeGate 请求 ID');

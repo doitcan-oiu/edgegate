@@ -1,7 +1,6 @@
 import type { Env } from './types';
 import { cfApi, cfGraphql, accountId, gatewayId, gatewayPath } from './cloudflare';
 import { ApiError } from './lib/errors';
-import { sha256 } from './lib/crypto';
 
 export interface GatewayLog {
   id: string; created_at: string; duration: number; model: string; provider: string; success: boolean;
@@ -22,19 +21,23 @@ export function normalizeLog(log: GatewayLog) {
     upstream_model: log.model, provider: log.provider, source: 'cloudflare',
   };
 }
-export async function fetchLogPage(env: Env, page: number) {
-  // Read the live log list newest first. Retention and SSE lookback are local
-  // stopping conditions, not upstream date filters.
-  const params = new URLSearchParams({ page: String(page), per_page: '50', order_by: 'created_at',
+export async function fetchLogPage(env: Env, page: number, options: { perPage?: number; status?: string; model?: string; search?: string; signal?: AbortSignal } = {}) {
+  const perPage = Math.max(1, Math.min(50, Math.floor(options.perPage || 50)));
+  const params = new URLSearchParams({ page: String(page), per_page: String(perPage), order_by: 'created_at',
     order_by_direction: 'desc', meta_info: 'true' });
-  const response = await cfApi<GatewayLog[]>(env, `${gatewayPath(env)}/logs?${params}`);
-  if (!Array.isArray(response.result) || response.result.some(log => !log.id || !Number.isFinite(Date.parse(log.created_at)))) {
+  if (options.status === 'success') params.set('success', 'true');
+  if (options.status === 'error') params.set('success', 'false');
+  if (options.model) params.set('model', options.model.slice(0, 160));
+  if (options.search) params.set('search', options.search.slice(0, 160));
+  const response = await cfApi<GatewayLog[]>(env, `${gatewayPath(env)}/logs?${params}`, { signal: options.signal });
+  if (!Array.isArray(response.result) || response.result.some(log => !log || typeof log.id !== 'string' || !log.id || !Number.isFinite(Date.parse(log.created_at)))) {
     throw new ApiError(502, 'cloudflare_invalid_response', 'Cloudflare 日志列表格式异常');
   }
   const info = response.result_info;
   return { logs: response.result.map(log => ({ ...normalizeLog(log), created_at: new Date(log.created_at).toISOString() })),
+    total: info?.total_count ?? null,
     has_more: info?.total_pages != null ? page < info.total_pages
-      : info?.total_count != null ? page * 50 < info.total_count : response.result.length === 50 };
+      : info?.total_count != null ? page * perPage < info.total_count : response.result.length === perPage };
 }
 
 type Metrics = { tokensIn?: number; tokensOut?: number; cost?: number; erroredRequests?: number; cachedRequests?: number };
@@ -43,15 +46,9 @@ interface Analytics { viewer: { accounts: { summary: Group[]; series: Group[]; m
 interface Schema { fields: { name: string }[] }
 async function metricFields(env: Env) {
   // Query Cloudflare's live schema instead of assuming every account exposes the same metrics.
-  const key = `cf:analytics-schema:${accountId(env)}:${(await sha256(env.CF_API_TOKEN || '')).slice(0, 16)}`;
-  const saved = await env.KV.get<string[]>(key, 'json').catch(() => null);
-  if (saved) return saved;
   const schema = await cfGraphql<{ sum: Schema | null }>(env, '{ sum: __type(name: "AccountAiGatewayRequestsAdaptiveGroupsSum") { fields { name } } }');
   const supported = new Set(schema.sum?.fields.map(f => f.name) || []);
   const fields = ['tokensIn', 'tokensOut', 'cost', 'erroredRequests', 'cachedRequests'].filter(name => supported.has(name));
-  // Concurrent cold starts may hit KV's same-key write limit. Schema caching is
-  // optional and must not discard a successful Cloudflare response.
-  await env.KV.put(key, JSON.stringify(fields), { expirationTtl: 86400 }).catch(() => {});
   return fields;
 }
 export async function fetchStats(env: Env, range: '24h' | '7d') {

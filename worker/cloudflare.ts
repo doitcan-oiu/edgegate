@@ -22,23 +22,44 @@ export const inferenceToken = (env: Env) => env.CF_AIG_TOKEN || env.CF_API_TOKEN
 export const providerPath = (env: Env) => `/accounts/${accountId(env)}/ai-gateway/custom-providers`;
 export const gatewayPath = (env: Env) => `/accounts/${accountId(env)}/ai-gateway/gateways/${encodeURIComponent(gatewayId(env))}`;
 
-async function cloudflareFetch(env: Env, path: string, options: RequestInit = {}) {
+function retryDelay(milliseconds: number, signal?: AbortSignal | null) {
+  return new Promise<void>((resolve, reject) => {
+    if (signal?.aborted) { reject(signal.reason); return; }
+    const onAbort = () => { clearTimeout(timer); reject(signal?.reason); };
+    const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, milliseconds);
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+async function cloudflareFetch(env: Env, path: string, options: RequestInit = {}, readOnlyQuery = false) {
   const token = controlToken(env);
-  let response: Response;
-  try {
-    response = await fetch(`${origin}${path}`, { ...options, redirect: 'manual', signal: AbortSignal.timeout(20000),
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-    });
-  } catch { throw new ApiError(502, 'cloudflare_connection_error', '无法连接 Cloudflare API，请稍后重试'); }
-  if (!response.ok) {
-    await response.body?.cancel();
-    if ([401, 403].includes(response.status)) throw new ApiError(502, 'cloudflare_permission_denied', 'Cloudflare 拒绝访问，请检查 CF_API_TOKEN 的账户范围与 AI Gateway / Account Analytics 权限');
-    if (response.status === 404) throw new ApiError(404, 'cloudflare_not_found', 'Cloudflare 上不存在该资源，请检查 Account ID、Gateway ID 或服务商 ID');
-    if (response.status === 429) throw new ApiError(429, 'cloudflare_rate_limited', 'Cloudflare API 已限流，请稍后重试');
-    throw new ApiError(response.status === 409 ? 409 : 502, 'cloudflare_api_error', `Cloudflare API 返回 ${response.status}；请检查服务商 slug 是否重复及配置是否有效`);
+  const maxRetries = readOnlyQuery || ['GET', 'HEAD'].includes((options.method || 'GET').toUpperCase()) ? 2 : 0;
+  for (let attempt = 0; ; attempt++) {
+    let response: Response;
+    try {
+      options.signal?.throwIfAborted();
+      if (attempt) await retryDelay(250 * 2 ** (attempt - 1), options.signal);
+      options.signal?.throwIfAborted();
+      const timeout = AbortSignal.timeout(20000);
+      const signal = options.signal ? AbortSignal.any([options.signal, timeout]) : timeout;
+      response = await fetch(`${origin}${path}`, { ...options, redirect: 'manual', signal,
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      });
+    } catch { throw new ApiError(502, 'cloudflare_connection_error', '无法连接 Cloudflare API，请稍后重试'); }
+    if (!response.ok) {
+      await response.body?.cancel().catch(() => {});
+      if (response.status >= 500 && response.status <= 599) {
+        if (attempt < maxRetries) continue;
+        throw new ApiError(502, 'cloudflare_api_error', `Cloudflare API 返回 ${response.status}${maxRetries ? '，已重试 2 次（共 3 次请求）' : ''}；Cloudflare 服务暂时不可用，请稍后重试`);
+      }
+      if ([401, 403].includes(response.status)) throw new ApiError(502, 'cloudflare_permission_denied', 'Cloudflare 拒绝访问，请检查 CF_API_TOKEN 的账户范围与 AI Gateway / Account Analytics 权限');
+      if (response.status === 404) throw new ApiError(404, 'cloudflare_not_found', 'Cloudflare 上不存在该资源，请检查 Account ID、Gateway ID 或服务商 ID');
+      if (response.status === 429) throw new ApiError(429, 'cloudflare_rate_limited', 'Cloudflare API 已限流，请稍后重试');
+      throw new ApiError(response.status === 409 ? 409 : 502, 'cloudflare_api_error', `Cloudflare API 返回 ${response.status}；请检查服务商 slug 是否重复及配置是否有效`);
+    }
+    try { return JSON.parse(await readLimited(response)) as unknown; }
+    catch { throw new ApiError(502, 'cloudflare_invalid_response', 'Cloudflare API 返回了无法读取的数据'); }
   }
-  try { return JSON.parse(await readLimited(response)) as unknown; }
-  catch { throw new ApiError(502, 'cloudflare_invalid_response', 'Cloudflare API 返回了无法读取的数据'); }
 }
 export async function cfApi<T>(env: Env, path: string, options?: RequestInit): Promise<CloudflareEnvelope<T>> {
   const data = await cloudflareFetch(env, path, options) as CloudflareEnvelope<T>;
@@ -46,7 +67,9 @@ export async function cfApi<T>(env: Env, path: string, options?: RequestInit): P
   return data;
 }
 export async function cfGraphql<T>(env: Env, query: string): Promise<T> {
-  const result = await cloudflareFetch(env, '/graphql', { method: 'POST', body: JSON.stringify({ query }) }) as { data?: T; errors?: unknown[] };
+  // Only query operations are safe to replay, including shorthand introspection queries.
+  const readOnlyQuery = /^(?:\s|#[^\r\n]*(?:\r?\n|$))*(?:query\b|\{)/.test(query);
+  const result = await cloudflareFetch(env, '/graphql', { method: 'POST', body: JSON.stringify({ query }) }, readOnlyQuery) as { data?: T; errors?: unknown[] };
   if (result.errors?.length || !result.data) throw new ApiError(502, 'cloudflare_analytics_error', 'Cloudflare 分析查询失败，请检查 Account Analytics 权限、查询时间范围和数据集可用性');
   return result.data;
 }

@@ -23,10 +23,10 @@
   "cloudflare": {
     "bindings": {
       "DB": {
-        "description": "D1 数据库，保存渠道、模型、应用 API Key、配额及日志 / 统计缓存；部署脚本会自动应用 migrations。"
+        "description": "D1 数据库，保存渠道、模型、应用 API Key、配额和上游错误追踪；部署脚本会自动应用 migrations。"
       },
       "KV": {
-        "description": "KV 命名空间，保存管理员会话和 Cloudflare 分析 Schema 缓存。"
+        "description": "KV 命名空间，保存管理员会话。"
       },
       "CLOUDFLARE_ACCOUNT_ID": {
         "description": "AI Gateway 所在账户的 32 位 Account ID，可在 Cloudflare 控制台查看。"
