@@ -96,6 +96,7 @@
 .route-model-options .list-box-item { min-height: 32px; padding: 6px 8px; }
 .route-model-options .list-box-item > span { overflow-wrap: anywhere; }
 .route-model-empty { display: block; padding: 10px; color: var(--muted); font-size: 12px; }
+.route-channel-tags { display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 @media (max-width: 1100px) {
   .model-workspace { grid-template-columns: 224px minmax(0,1fr); }
   .routing-workspace { padding-inline: 14px; }

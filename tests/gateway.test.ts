@@ -110,7 +110,7 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql', '0009_remove_observability_cache.sql', '0010_recoverable_api_keys.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql', '0009_remove_observability_cache.sql', '0010_recoverable_api_keys.sql', '0011_cross_tag_routes.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
@@ -681,12 +681,12 @@ describe('tag-scoped model and route administration', () => {
     expect(await admin('/models?tag=BB')).toMatchObject([{ id: model.id, description: 'shared description', enabled: 0, routes: [routeB] }]);
     expect((await admin<(Model & { routes: Route[] })[]>('/models?tag=AA'))[0].routes).toHaveLength(2);
   });
-  it('rejects source and destination routes outside the selected tag, including stale tags', async () => {
+  it('allows cross-tag destinations but rejects source routes outside the selected tag, including stale tags', async () => {
     const { a, b, model, routeA, routeB } = await sharedChannels();
     const data = { model_id: model.id, channel_id: a.channelId, upstream_model: 'changed' };
-    expect((await request('/api/routes?tag=AA', { admin: true, body: { ...data, channel_id: b.channelId } })).status).toBe(400);
+    expect((await request('/api/routes?tag=AA', { admin: true, body: { ...data, channel_id: b.channelId } })).status).toBe(201);
     expect((await request(`/api/routes/${routeB.id}?tag=AA`, { admin: true, method: 'PUT', body: data })).status).toBe(409);
-    expect((await request(`/api/routes/${routeA.id}?tag=AA`, { admin: true, method: 'PUT', body: { ...data, channel_id: b.channelId } })).status).toBe(400);
+    expect((await request(`/api/routes/${routeA.id}?tag=AA`, { admin: true, method: 'PUT', body: { ...data, channel_id: b.channelId } })).status).toBe(409);
     expect((await request(`/api/routes/${routeB.id}?tag=AA`, { admin: true, method: 'DELETE' })).status).toBe(409);
     await editProvider(a.provider, { tags: ['CC'] });
     expect((await request(`/api/routes/${routeA.id}?tag=AA`, { admin: true, method: 'PUT', body: data })).status).toBe(409);
@@ -711,6 +711,113 @@ describe('tag-scoped model and route administration', () => {
     await admin(`/routes/${route.id}?tag=AA`, { model_id: 'claude-opus-5', channel_id: a.channelId, upstream_model: route.upstream_model, weight: 7, enabled: false }, 'PUT');
     const bb = await admin<(Model & { routes: Route[] })[]>('/models?tag=BB');
     expect(bb[0].routes).toHaveLength(1); expect(bb[0].routes[0]).toMatchObject({ id: route.id, weight: 7, enabled: 0 });
+  });
+});
+
+describe('explicit cross-tag model routes', () => {
+  const model = 'gpt5.6-sol';
+  async function setup() {
+    const a = await catalog('CrossA', 'openai', ['AA'], [model]);
+    const b = await catalog('CrossB', 'openai', ['BB'], [model, 'b-private']);
+    const c = await catalog('CrossC', 'openai', ['CC'], [model]);
+    const originalB = await db.prepare('SELECT * FROM routes WHERE channel_id = ? ORDER BY id').bind(b.channelId).all();
+    const input = { model_id: model, channel_id: b.channelId, upstream_model: model, priority: 4, weight: 7 };
+    const cross = await admin<{ id: string }>('/routes?tag=AA', input);
+    const token = (await key({ allowed_tags: ['AA'] })).key;
+    return { a, b, c, cross, input, token, originalB: originalB.results };
+  }
+  it('adds the same upstream model independently to AA and keeps the BB directory and settings intact', async () => {
+    const { a, b, cross, input, originalB } = await setup();
+    const aa = await admin<(Model & { routes: Route[] })[]>('/models?tag=AA');
+    expect(aa).toHaveLength(1);
+    expect(aa[0].routes).toHaveLength(2);
+    expect(aa[0].routes).toEqual(expect.arrayContaining([
+      expect.objectContaining({ channel_id: a.channelId, scope_tag: '' }),
+      expect.objectContaining({ id: cross.id, channel_id: b.channelId, scope_tag: 'AA', priority: 4, weight: 7 }),
+    ]));
+    expect((await admin<(Model & { routes: Route[] })[]>('/models?tag=BB')).flatMap(m => m.routes).map(r => r.id).sort()).toEqual(originalB.map(r => r.id).sort());
+    expect((await request('/api/routes?tag=AA', { admin: true, body: input })).status).toBe(409);
+    await admin('/routes?tag=CC', { ...input, weight: 2 });
+    await admin('/routes/' + cross.id + '?tag=AA', { ...input, priority: 8, weight: 11, enabled: false }, 'PUT');
+    for (const row of originalB) expect(await db.prepare('SELECT * FROM routes WHERE id = ?').bind(row.id).first()).toEqual(row);
+    expect(await db.prepare('SELECT weight FROM routes WHERE scope_tag = ?').bind('CC').first()).toEqual({ weight: 2 });
+    await admin('/routes/' + cross.id + '?tag=AA', undefined, 'DELETE');
+    expect((await admin<(Model & { routes: Route[] })[]>('/models?tag=AA'))[0].routes).toHaveLength(1);
+    for (const row of originalB) expect(await db.prepare('SELECT * FROM routes WHERE id = ?').bind(row.id).first()).toEqual(row);
+  });
+  it('fails over from AA to the explicitly added BB route, without exposing other BB models or CC routes', async () => {
+    const { b, cross, token } = await setup();
+    await runtime({ same_channel_retries: 0, cross_channel_retries: 4 });
+    upstream = req => req.url.includes('/custom-crossa/') ? MFResponse.json({ error: 'busy' }, { status: 503 }) : MFResponse.json(completion);
+    expect(await visibleModels(token)).toEqual([model]);
+    expect((await chat(token, { model })).status).toBe(200);
+    expect(calls.map(call => JSON.parse(call.headers['cf-aig-metadata']).channel_name)).toEqual(['CrossA', 'CrossB']);
+    expect(calls[1].body.model).toBe(model);
+    calls = [];
+    expect((await chat(token, { model: 'b-private' })).status).toBe(403);
+    const restricted = (await key({ allowed_tags: ['AA'], allowed_models: ['test-model'] })).key;
+    expect((await chat(restricted, { model })).status).toBe(403);
+    await admin('/routes/' + cross.id + '?tag=AA', undefined, 'DELETE');
+    expect((await chat(token, { model })).status).toBe(502);
+    expect(calls).toHaveLength(1); expect(calls[0].url).toContain('/custom-crossa/');
+    expect(await db.prepare('SELECT id FROM routes WHERE channel_id = ? AND model_id = ?').bind(b.channelId, model).first()).not.toBeNull();
+  });
+  it.each(['openai', 'anthropic', 'responses'] as const)('uses only the AA route for a cross-tag alias through %s and Playground', async protocol => {
+    const { a, b, input, token } = await setup();
+    await db.prepare('UPDATE channels SET enabled = 0 WHERE id = ?').bind(a.channelId).run();
+    await admin('/routes?tag=AA', { ...input, create_model: true, model_id: 'a-alias' });
+    const result = protocol === 'anthropic' ? await messages(token, { model: 'a-alias' })
+      : protocol === 'responses' ? await request('/v1/responses', { key: token, body: { model: 'a-alias', input: 'hello' } })
+      : await chat(token, { model: 'a-alias' });
+    expect(result.status).toBe(200); await result.text();
+    const playground = await request('/api/playground?tag=AA', { admin: true, body: { model: 'a-alias', messages: [{ role: 'user', content: 'hello' }] } });
+    expect(playground.status).toBe(200); await playground.text();
+    expect(calls).toHaveLength(2);
+    for (const call of calls) expect(JSON.parse(call.headers['cf-aig-metadata']).channel_id).toBe(b.channelId);
+    const bb = (await key({ allowed_tags: ['BB'] })).key;
+    expect(await visibleModels(bb)).not.toContain('a-alias');
+    expect((await chat(bb, { model: 'a-alias' })).status).toBe(403);
+    expect((await request('/api/playground?tag=BB', { admin: true, body: { model: 'a-alias', messages: [{ role: 'user', content: 'hello' }] } })).status).toBe(503);
+    await db.prepare('UPDATE channels SET enabled = 0 WHERE id = ?').bind(b.channelId).run();
+    expect(await visibleModels(token)).toEqual([]);
+    expect((await chat(token, { model: 'a-alias' })).status).toBe(403);
+  });
+  it('keeps explicit ownership after provider tag changes and catalog synchronization', async () => {
+    const { a, b, cross, token } = await setup();
+    await editProvider(a.provider, { tags: ['RENAMED'], models: [model] });
+    await editProvider(b.provider, { tags: ['BB', 'CC'], models: ['new-b-model'] });
+    expect(await db.prepare('SELECT scope_tag, managed_by_provider FROM routes WHERE id = ?').bind(cross.id).first()).toEqual({ scope_tag: 'AA', managed_by_provider: 0 });
+    expect(await admin('/tags')).toContain('AA');
+    expect((await admin<(Model & { routes: Route[] })[]>('/models?tag=AA'))[0].routes).toHaveLength(1);
+    const newToken = (await key({ allowed_tags: ['AA'] })).key;
+    expect(await visibleModels(token)).toEqual([model]); expect(await visibleModels(newToken)).toEqual([model]);
+    expect((await chat(newToken, { model })).status).toBe(200);
+    expect(calls[0].url).toContain('/custom-crossb/');
+    const cc = (await key({ allowed_tags: ['CC'] })).key;
+    expect(await visibleModels(cc)).toEqual([model, 'new-b-model']);
+    expect((await request('/api/routes/' + cross.id + '?tag=BB', { admin: true, method: 'DELETE' })).status).toBe(409);
+  });
+  it('pins an inherited route to AA when its target is changed to BB and preserves that ownership on later edits', async () => {
+    const a = await catalog('MoveA', 'openai', ['AA'], [model]);
+    const b = await catalog('MoveB', 'openai', ['BB'], [model]);
+    const aa = await admin<(Model & { routes: Route[] })[]>('/models?tag=AA'), id = aa[0].routes[0].id;
+    const bb = await admin('/models?tag=BB');
+    const input = { model_id: model, channel_id: b.channelId, upstream_model: model };
+    await admin('/routes/' + id + '?tag=AA', input, 'PUT');
+    expect(await db.prepare('SELECT scope_tag FROM routes WHERE id = ?').bind(id).first()).toEqual({ scope_tag: 'AA' });
+    expect(await admin('/models?tag=BB')).toEqual(bb);
+    await admin('/routes/' + id, { ...input, upstream_model: 'updated' }, 'PUT');
+    await admin('/routes/' + id + '?tag=AA', { ...input, channel_id: a.channelId }, 'PUT');
+    expect(await db.prepare('SELECT scope_tag FROM routes WHERE id = ?').bind(id).first()).toEqual({ scope_tag: 'AA' });
+  });
+  it('deduplicates channel attempts when a key is authorized for both the inherited and explicit routes', async () => {
+    await setup();
+    await runtime({ same_channel_retries: 0, cross_channel_retries: 5 });
+    upstream = () => MFResponse.json({ error: 'busy' }, { status: 503 });
+    const token = (await key({ allowed_tags: ['AA', 'BB'] })).key;
+    expect((await chat(token, { model })).status).toBe(502);
+    expect(calls).toHaveLength(2);
+    expect(new Set(calls.map(call => JSON.parse(call.headers['cf-aig-metadata']).channel_name))).toEqual(new Set(['CrossA', 'CrossB']));
   });
 });
 

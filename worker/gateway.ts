@@ -12,7 +12,7 @@ import { forwardStream } from './protocols/error-stream';
 import { getGatewaySettings } from './settings';
 import { publicUpstreamError, readUpstreamFailure, recordUpstreamFailure, upstreamFailure } from './upstream-errors';
 import { readRouteScope } from './route-scope';
-import { matchesRouteScope } from '../shared/route-scope';
+import { matchesScopedRoute } from '../shared/route-scope';
 
 async function retryPause(ms: number, signal: AbortSignal) {
   if (signal.aborted) return;
@@ -38,8 +38,8 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
   if (!canUseModel(key, input.model)) throw new ApiError(403, 'model_not_allowed', '该密钥没有此模型的访问权限');
   const allowedTags = JSON.parse(key.allowed_tags) as string[];
   const [accessible, settings] = await Promise.all([getCandidates(c.env, input.model, allowedTags), getGatewaySettings(c.env)]);
-  let available = scope ? accessible.filter(candidate => matchesRouteScope(candidate.channel.tags || [], scope)) : accessible;
-  if (allowedTags.length && !available.length) throw new ApiError(403, 'model_not_allowed', '该密钥的标签范围内没有此模型的可用服务商');
+  let available = scope ? accessible.filter(candidate => matchesScopedRoute(candidate, candidate.channel.tags || [], scope)) : accessible;
+  if (allowedTags.length && !available.length) throw new ApiError(403, 'model_not_allowed', '该密钥的标签范围内没有此模型的可用路由');
   // Provider-owned response/conversation IDs cannot move across upstream accounts.
   // Until affinity is persisted, state references require a single native channel.
   if (protocol === 'responses' && (input.previous_response_id || input.conversation)) {

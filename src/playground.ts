@@ -1,4 +1,4 @@
-import { matchesRouteScope, type RouteScope } from '../shared/route-scope';
+import { matchesScopedRoute, type RouteScope } from '../shared/route-scope';
 import type { Channel, Model } from './types';
 
 export type ConversationMessage = { role: 'user' | 'assistant'; content: string };
@@ -8,12 +8,15 @@ export type PlaygroundMessage = ConversationMessage & {
 };
 export interface PlaygroundParameters { model: string; system: string; temperature: number; maxTokens: number; stream: boolean }
 
-export function availablePlaygroundModels<T extends Pick<Model, 'enabled'> & { routes: Pick<Model['routes'][number], 'enabled' | 'channel_id'>[] }>(
+export function availablePlaygroundModels<T extends Pick<Model, 'enabled'> & { routes: Pick<Model['routes'][number], 'enabled' | 'channel_id' | 'scope_tag'>[] }>(
   models: T[], channels: Pick<Channel, 'id' | 'tags' | 'enabled' | 'configured'>[], scope: RouteScope | null,
 ) {
   if (!scope) return [];
-  const ids = new Set(channels.filter(channel => channel.enabled && channel.configured && matchesRouteScope(channel.tags, scope)).map(channel => channel.id));
-  return models.filter(model => model.enabled && model.routes.some(route => route.enabled && ids.has(route.channel_id)));
+  const byId = new Map(channels.filter(channel => channel.enabled && channel.configured).map(channel => [channel.id, channel]));
+  return models.filter(model => model.enabled && model.routes.some(route => {
+    const channel = byId.get(route.channel_id);
+    return route.enabled && channel && matchesScopedRoute(route, channel.tags, scope);
+  }));
 }
 
 export function inferenceBody(parameters: PlaygroundParameters, messages: ConversationMessage[]) {

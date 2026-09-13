@@ -8,7 +8,7 @@ import { logs, logDetail, stats } from './observability';
 import { channelAvailability } from './channel-availability';
 import { getGatewaySettings, saveGatewaySettings } from './settings';
 import { getErrorTraces } from './upstream-errors';
-import { checkRouteScope, readRouteScope, requireGlobalModelScope, scopeCondition } from './route-scope';
+import { checkRouteScope, knownTagsSql, readRouteScope, requireGlobalModelScope, routeScopeCondition } from './route-scope';
 
 export const admin = new Hono<AppEnv>();
 admin.get('/config', async c => c.json({
@@ -29,7 +29,7 @@ admin.get('/traces/:requestId', async c => {
 admin.get('/channels/availability', channelAvailability);
 admin.route('/', channels);
 admin.get('/models', async c => {
-  const scope = readRouteScope(c), condition = scopeCondition(scope, 'channel_id');
+  const scope = readRouteScope(c), condition = routeScopeCondition(scope);
   const [models, routes] = await Promise.all([
     c.env.DB.prepare('SELECT * FROM models ORDER BY created_at, id').all<Model>(),
     c.env.DB.prepare(`SELECT * FROM routes WHERE ${condition.sql} ORDER BY priority, id`).bind(...condition.values).all<Route>(),
@@ -55,21 +55,20 @@ admin.delete('/models/:id', async c => {
   await c.env.DB.prepare('DELETE FROM models WHERE id = ?').bind(c.req.param('id')).run();
   return c.json({ ok: true });
 });
-async function validateRoute(data: ReturnType<typeof routeSchema.parse>, db: D1Database, excludeId = '', allowNewModel = false) {
+async function validateRoute(data: ReturnType<typeof routeSchema.parse>, db: D1Database, scopeTag: string, excludeId = '', allowNewModel = false) {
   const [model, channel, duplicate] = await Promise.all([
     db.prepare('SELECT id FROM models WHERE id = ?').bind(data.model_id).first(),
     db.prepare('SELECT id FROM channels WHERE id = ?').bind(data.channel_id).first(),
-    db.prepare('SELECT id FROM routes WHERE model_id = ? AND channel_id = ? AND upstream_model = ? AND id != ?').bind(data.model_id, data.channel_id, data.upstream_model, excludeId).first(),
+    db.prepare('SELECT id FROM routes WHERE model_id = ? AND channel_id = ? AND upstream_model = ? AND scope_tag = ? AND id != ?').bind(data.model_id, data.channel_id, data.upstream_model, scopeTag, excludeId).first(),
   ]);
   if ((!model && !allowNewModel) || !channel) throw invalid('请选择有效的模型和渠道');
   if (duplicate) throw new ApiError(409, 'conflict', '该路由已存在');
 }
 admin.post('/routes', async c => {
   const data = routeCreateSchema.parse(await c.req.json());
-  await checkRouteScope(c, data.channel_id);
-  await validateRoute(data, c.env.DB, '', data.create_model);
+  const { scopeTag, target } = await checkRouteScope(c, data.channel_id);
+  await validateRoute(data, c.env.DB, scopeTag, '', data.create_model);
   const id = `rt_${randomToken(12)}`;
-  const target = scopeCondition(readRouteScope(c), 'id');
   // One transaction creates the optional model and its scoped route together.
   // Reusing an ID must preserve its global description and enabled state.
   let results: D1Result[];
@@ -77,9 +76,9 @@ admin.post('/routes', async c => {
     results = await c.env.DB.batch([
       c.env.DB.prepare(`INSERT INTO models (id) SELECT ? WHERE ? AND EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})
         ON CONFLICT(id) DO NOTHING`).bind(data.model_id, +data.create_model, data.channel_id, ...target.values),
-      c.env.DB.prepare(`INSERT INTO routes (id, model_id, channel_id, upstream_model, priority, weight, input_price, output_price, enabled)
-        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})`)
-        .bind(id, data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, data.channel_id, ...target.values),
+      c.env.DB.prepare(`INSERT INTO routes (id, model_id, channel_id, upstream_model, priority, weight, input_price, output_price, enabled, scope_tag)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})`)
+        .bind(id, data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, scopeTag, data.channel_id, ...target.values),
     ]);
   } catch (error) {
     if (error instanceof Error && error.message.includes('UNIQUE constraint failed: routes.model_id, routes.channel_id, routes.upstream_model')) {
@@ -92,23 +91,23 @@ admin.post('/routes', async c => {
 });
 admin.put('/routes/:id', async c => {
   const data = routeSchema.parse(await c.req.json()), id = c.req.param('id');
-  await checkRouteScope(c, data.channel_id, id);
-  await validateRoute(data, c.env.DB, id);
-  const scope = readRouteScope(c), source = scopeCondition(scope, 'channel_id'), target = scopeCondition(scope, 'id');
-  const result = await c.env.DB.prepare(`UPDATE routes SET managed_by_provider = 0, model_id = ?, channel_id = ?, upstream_model = ?, priority = ?, weight = ?, input_price = ?, output_price = ?, enabled = ?
+  const { scopeTag, source, target } = await checkRouteScope(c, data.channel_id, id);
+  await validateRoute(data, c.env.DB, scopeTag, id);
+  const scope = readRouteScope(c);
+  const result = await c.env.DB.prepare(`UPDATE routes SET managed_by_provider = 0, model_id = ?, channel_id = ?, upstream_model = ?, priority = ?, weight = ?, input_price = ?, output_price = ?, enabled = ?, scope_tag = ?
     WHERE id = ? AND ${source.sql} AND EXISTS (SELECT 1 FROM channels WHERE id = ? AND ${target.sql})`)
-    .bind(data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, id, ...source.values, data.channel_id, ...target.values).run();
+    .bind(data.model_id, data.channel_id, data.upstream_model, data.priority, data.weight, data.input_price, data.output_price, +data.enabled, scopeTag, id, ...source.values, data.channel_id, ...target.values).run();
   if (!result.meta.changes) throw new ApiError(scope.kind === 'all' ? 404 : 409, 'route_scope_changed', '路由不存在或标签范围已变化，请刷新后重试');
   return c.json({ ok: true });
 });
 admin.delete('/routes/:id', async c => {
-  const scope = readRouteScope(c), condition = scopeCondition(scope, 'channel_id');
+  const scope = readRouteScope(c), condition = routeScopeCondition(scope);
   const result = await c.env.DB.prepare(`DELETE FROM routes WHERE id = ? AND ${condition.sql}`).bind(c.req.param('id'), ...condition.values).run();
   if (scope.kind !== 'all' && !result.meta.changes) throw new ApiError(409, 'route_scope_changed', '路由已不属于当前标签，请刷新后重试');
   return c.json({ ok: true });
 });
 admin.get('/tags', async c => {
-  const { results } = await c.env.DB.prepare('SELECT DISTINCT value AS tag FROM provider_profiles, json_each(provider_profiles.tags) ORDER BY value').all<{ tag: string }>();
+  const { results } = await c.env.DB.prepare(`${knownTagsSql} ORDER BY tag`).all<{ tag: string }>();
   return c.json(results.map(row => row.tag));
 });
 admin.get('/keys', async c => {
@@ -135,7 +134,7 @@ admin.post('/keys', async c => {
   if (data.expires_at && Date.parse(data.expires_at) <= Date.now()) throw invalid('过期时间必须晚于当前时间');
   const available = await c.env.DB.prepare('SELECT id FROM models').all<{ id: string }>();
   if (data.allowed_models.some(id => !available.results.some(m => m.id === id))) throw invalid('授权模型不存在');
-  const known = await c.env.DB.prepare('SELECT DISTINCT value AS tag FROM provider_profiles, json_each(provider_profiles.tags)').all<{ tag: string }>();
+  const known = await c.env.DB.prepare(knownTagsSql).all<{ tag: string }>();
   if (data.allowed_tags.some(tag => !known.results.some(row => row.tag === tag))) throw invalid('所选服务商标签不存在');
   const key = `eg_${randomToken()}`, id = `key_${randomToken(12)}`;
   const [hash, encrypted] = await Promise.all([sha256(key), encryptSecret(key, c.env.ENCRYPTION_KEY, `api-key:${id}`)]);

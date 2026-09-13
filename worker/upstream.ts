@@ -38,7 +38,10 @@ export async function getCandidates(env: Env, model?: string, allowedTags: strin
     c.secret_encrypted AS c_secret, c.timeout_ms AS c_timeout, c.created_at AS c_created, c.auto_create_routes AS c_auto_routes,
     c.provider_id AS c_provider_id, c.provider_slug AS c_provider_slug, c.gateway_path AS c_path, c.byok_alias AS c_alias, COALESCE(p.protocol, 'openai') AS c_protocol, COALESCE(p.tags, '[]') AS c_tags
     FROM routes r JOIN channels c ON c.id = r.channel_id JOIN models m ON m.id = r.model_id LEFT JOIN provider_profiles p ON p.provider_id = c.provider_id
-    WHERE (? IS NULL OR r.model_id = ?) AND (json_array_length(?) = 0 OR EXISTS (SELECT 1 FROM json_each(p.tags) AS tag JOIN json_each(?) AS allowed ON tag.value = allowed.value)) AND r.enabled = 1 AND c.enabled = 1 AND m.enabled = 1 ORDER BY r.priority, r.id`).bind(model ?? null, model ?? null, JSON.stringify(allowedTags), JSON.stringify(allowedTags)).all<Route & {
+    WHERE (? IS NULL OR r.model_id = ?) AND (json_array_length(?) = 0 OR EXISTS (
+      SELECT 1 FROM json_each(CASE WHEN r.scope_tag != '' THEN json_array(r.scope_tag) ELSE COALESCE(p.tags, '[]') END) AS tag
+      JOIN json_each(?) AS allowed ON tag.value = allowed.value
+    )) AND r.enabled = 1 AND c.enabled = 1 AND m.enabled = 1 ORDER BY r.priority, r.id`).bind(model ?? null, model ?? null, JSON.stringify(allowedTags), JSON.stringify(allowedTags)).all<Route & {
       c_name: string; c_kind: Channel['kind']; c_base_url: string; c_secret: string | null; c_timeout: number; c_created: string; c_auto_routes: number;
       c_protocol: NonNullable<Channel['protocol']>; c_tags: string; c_provider_id: string | null; c_provider_slug: string | null; c_path: string; c_alias: string;
     }>();

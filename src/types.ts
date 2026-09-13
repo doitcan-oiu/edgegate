@@ -11,6 +11,7 @@ export interface CustomProvider extends ProviderProfile { id: string; name: stri
 export interface ProviderPage { data: CustomProvider[]; page: number; total: number | null; has_more: boolean }
 export interface Route {
   id: string; model_id: string; channel_id: string; upstream_model: string;
+  scope_tag?: string;
   priority: number; weight: number; input_price: number | null; output_price: number | null; enabled: number;
 }
 export interface Model { id: string; description: string; enabled: number; created_at: string; routes: Route[] }

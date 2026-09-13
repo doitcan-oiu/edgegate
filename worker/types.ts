@@ -25,6 +25,7 @@ export interface Channel {
 export interface Model { id: string; description: string; enabled: number; created_at: string }
 export interface Route {
   id: string; model_id: string; channel_id: string; upstream_model: string;
+  scope_tag?: string; // Empty or absent: inherit channel tags. Otherwise: this tag only.
   priority: number; weight: number; input_price: number | null; output_price: number | null; enabled: number;
 }
 export type Candidate = Route & { channel: Channel };

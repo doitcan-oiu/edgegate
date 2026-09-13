@@ -4,7 +4,7 @@ import { memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState
 import { ArrowDown, ArrowUp, Code2, Copy, Eraser, RotateCcw, SlidersHorizontal, Square } from 'lucide-react';
 import { copy, RefreshContext, ToastContext, useApi } from '../lib';
 import type { Model, Channel } from '../types';
-import { routeScopeQuery, type RouteScope } from '../../shared/route-scope';
+import { routeScopeQuery, routeScopeTags, type RouteScope } from '../../shared/route-scope';
 import { Button, ErrorBox, Field, Toggle, Input, TextArea, Modal } from '../components';
 import { availablePlaygroundModels, conversationForRetry, inferenceBody, playgroundSnippet, readPlaygroundStream, type PlaygroundMessage } from '../playground';
 
@@ -23,7 +23,7 @@ const MessageContent = memo(function MessageContent({ content }: { content: stri
 export function Playground() {
   const models = useApi<Model[]>('/models'), channels = useApi<Channel[]>('/channels');
   const [requestedScope, setScope] = useState('');
-  const tags = [...new Set(channels.data?.flatMap(channel => channel.tags) || [])].sort();
+  const tags = routeScopeTags(models.data || [], channels.data || []);
   const scopeOptions = [...tags.map(tag => ({ value: `tag:${tag}`, label: tag })),
     ...(channels.data?.some(channel => !channel.tags.length) ? [{ value: 'untagged', label: '未打标签' }] : [])];
   const scopeValue = requestedScope || scopeOptions[0]?.value || '';
