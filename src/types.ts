@@ -15,6 +15,7 @@ export interface Route {
 }
 export interface Model { id: string; description: string; enabled: number; created_at: string; routes: Route[] }
 export interface ApiKey {
+  can_reveal: boolean;
   allowed_tags: string[];
   id: string; name: string; prefix: string; allowed_models: string[]; rpm: number; daily_limit: number;
   expires_at: string | null; revoked_at: string | null; created_at: string; requests_today: number;

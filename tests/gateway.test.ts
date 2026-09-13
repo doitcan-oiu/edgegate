@@ -3,7 +3,7 @@ import { build } from 'esbuild';
 import { readFile } from 'node:fs/promises';
 import { ReadableStream as NodeReadableStream } from 'node:stream/web';
 import { Miniflare, convertV4MiniflareOptions, Response as MFResponse, type Request as MFRequest } from 'miniflare';
-import { decryptSecret, encryptSecret } from '../worker/lib/crypto';
+import { decryptSecret, encryptSecret, sha256 } from '../worker/lib/crypto';
 import { orderCandidates } from '../worker/upstream';
 import { safeBaseUrl } from '../worker/lib/validation';
 import { normalizeLog } from '../worker/cloudflare-observability';
@@ -110,7 +110,7 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql', '0009_remove_observability_cache.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql', '0009_remove_observability_cache.sql', '0010_recoverable_api_keys.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
@@ -144,7 +144,7 @@ describe('access control', () => {
     for (const flag of ['HttpOnly', 'Secure', 'SameSite=Strict']) expect(login.headers.get('set-cookie')).toContain(flag);
     await admin('/auth/logout', {}, 'POST'); expect((await request('/api/channels', { admin: true })).status).toBe(401);
   });
-  it('stores only client key hashes and masks secrets in lists', async () => {
+  it('never stores plaintext client keys or exposes credentials in lists', async () => {
     const created = await key(), record = await db.prepare('SELECT * FROM api_keys WHERE id = ?').bind(created.id).first();
     expect(JSON.stringify(record)).not.toContain(created.key);
     expect(JSON.stringify(await admin('/keys'))).not.toContain(created.key);
@@ -171,6 +171,80 @@ describe('access control', () => {
   });
   it('rejects oversized inference bodies before reaching Cloudflare', async () => {
     expect((await chat((await key()).key, { messages: [{ role: 'user', content: 'a'.repeat(2 * 1024 * 1024) }] })).status).toBe(413); expect(calls).toHaveLength(0);
+  });
+});
+
+describe('application token retrieval', () => {
+  async function withEncryption(path: string, encryption: string | undefined, body?: unknown) {
+    return worker.fetch(new Request(`https://edgegate.example/api${path}`, { method: body ? 'POST' : 'GET',
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined }), {
+      DB: db, KV: await mf.getKVNamespace('KV'), ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: encryption,
+    } as unknown as Env);
+  }
+  it('encrypts new tokens, masks lists, and retrieves the original only for administrators', async () => {
+    const created = await key({ name: 'Recoverable', allowed_models: ['test-model'] });
+    const saved = (await db.prepare('SELECT key_hash, token_encrypted FROM api_keys WHERE id = ?').bind(created.id).first<{ key_hash: string; token_encrypted: string }>())!;
+    expect(saved.key_hash).toBe(await sha256(created.key));
+    expect(saved.token_encrypted).toBeTruthy(); expect(saved.token_encrypted).not.toContain(created.key);
+    expect(await decryptSecret(saved.token_encrypted, ENCRYPTION, `api-key:${created.id}`)).toBe(created.key);
+    const list = await admin<Record<string, unknown>[]>('/keys');
+    expect(list.find(row => row.id === created.id)).toMatchObject({ can_reveal: true });
+    for (const field of ['key_hash', 'token_encrypted', 'key']) expect(list[0]).not.toHaveProperty(field);
+    for (const options of [{}, { key: created.key }]) {
+      const denied = await request(`/api/keys/${created.id}/token`, options);
+      expect(denied.status).toBe(401); expect(await denied.text()).not.toContain(created.key);
+    }
+    for (let i = 0; i < 2; i++) {
+      const revealed = await request(`/api/keys/${created.id}/token`, { admin: true });
+      expect(revealed.status).toBe(200); expect(revealed.headers.get('cache-control')).toBe('no-store');
+      expect(await revealed.json()).toEqual({ key: created.key });
+    }
+    expect((await request('/v1/models', { key: created.key })).status).toBe(200);
+  });
+  it('keeps hash-only legacy tokens usable and explicitly reports their originals unavailable', async () => {
+    const created = await key();
+    await db.prepare('UPDATE api_keys SET token_encrypted = NULL WHERE id = ?').bind(created.id).run();
+    expect((await admin<Record<string, unknown>[]>('/keys')).find(row => row.id === created.id)).toMatchObject({ can_reveal: false });
+    const response = await request(`/api/keys/${created.id}/token`, { admin: true });
+    expect(response.status).toBe(409); expect(await response.json()).toMatchObject({ error: { code: 'key_not_recoverable' } });
+    expect((await request('/v1/models', { key: created.key })).status).toBe(200);
+    expect(await db.prepare('SELECT key_hash FROM api_keys WHERE id = ?').bind(created.id).first()).toEqual({ key_hash: await sha256(created.key) });
+  });
+  it('requires a current admin session and does not reactivate revoked or expired keys', async () => {
+    const revoked = await key(), expired = await key();
+    await admin(`/keys/${revoked.id}`, undefined, 'DELETE');
+    await db.prepare("UPDATE api_keys SET expires_at = '2000-01-01T00:00:00.000Z' WHERE id = ?").bind(expired.id).run();
+    for (const created of [revoked, expired]) {
+      expect(await admin(`/keys/${created.id}/token`)).toEqual({ key: created.key });
+      expect((await request('/v1/models', { key: created.key })).status).toBe(401);
+    }
+    await admin('/auth/logout', {}, 'POST');
+    expect((await request(`/api/keys/${revoked.id}/token`, { admin: true })).status).toBe(401);
+  });
+  it.each([undefined, 'invalid-base64', btoa('short')])('does not create unrecoverable keys with invalid encryption: %s', async encryption => {
+    const before = await db.prepare('SELECT COUNT(*) AS n FROM api_keys').first();
+    const response = await withEncryption('/keys', encryption, { name: 'Missing encryption' });
+    expect(response.status).toBe(503); expect(await response.json()).toMatchObject({ error: { code: 'encryption_setup_required' } });
+    expect(await db.prepare('SELECT COUNT(*) AS n FROM api_keys').first()).toEqual(before);
+  });
+  it('reports missing keys and missing encryption clearly without returning ciphertext', async () => {
+    expect((await request('/api/keys/does-not-exist/token', { admin: true })).status).toBe(404);
+    const created = await key();
+    const response = await withEncryption(`/keys/${created.id}/token`, undefined);
+    expect(response.status).toBe(503); expect(await response.json()).toMatchObject({ error: { code: 'encryption_setup_required' } });
+  });
+  it('fails safely after key rotation or ciphertext substitution between application keys', async () => {
+    const first = await key(), second = await key();
+    const ciphertext = (await db.prepare('SELECT token_encrypted FROM api_keys WHERE id = ?').bind(first.id).first<{ token_encrypted: string }>())!.token_encrypted;
+    const rotated = await withEncryption(`/keys/${first.id}/token`, btoa('abcdefghijklmnopqrstuvwxyz012345'));
+    expect(rotated.status).toBe(500); expect(await rotated.json()).toMatchObject({ error: { code: 'key_decryption_failed' } });
+    await db.prepare('UPDATE api_keys SET token_encrypted = ? WHERE id = ?').bind(ciphertext, second.id).run();
+    const response = await request(`/api/keys/${second.id}/token`, { admin: true });
+    expect(response.status).toBe(500);
+    const body = await response.text();
+    expect(body).toContain('key_decryption_failed');
+    for (const secret of [first.key, second.key, ciphertext, ENCRYPTION]) expect(body).not.toContain(secret);
+    expect((await request('/v1/models', { key: second.key })).status).toBe(200);
   });
 });
 

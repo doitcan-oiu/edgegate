@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import type { AppEnv, Model, Route } from './types';
 import { ApiError, invalid } from './lib/errors';
-import { encryptionConfigured, randomToken, sha256 } from './lib/crypto';
+import { decryptSecret, encryptSecret, encryptionConfigured, randomToken, sha256 } from './lib/crypto';
 import { modelSchema, routeSchema, routeCreateSchema, keySchema } from './lib/validation';
 import { channels } from './channels';
 import { logs, logDetail, stats } from './observability';
@@ -113,20 +113,34 @@ admin.get('/tags', async c => {
 });
 admin.get('/keys', async c => {
   const { results } = await c.env.DB.prepare(`SELECT k.id, k.name, k.prefix, k.allowed_tags, k.allowed_models, k.rpm, k.daily_limit, k.expires_at, k.revoked_at, k.created_at,
+    CASE WHEN k.token_encrypted IS NOT NULL THEN 1 ELSE 0 END AS can_reveal,
     CASE WHEN c.day = ? THEN c.day_count ELSE 0 END AS requests_today
     FROM api_keys k LEFT JOIN key_counters c ON c.key_id = k.id ORDER BY k.created_at DESC`).bind(Math.floor(Date.now() / 86400000)).all();
-  return c.json(results.map(row => ({ ...row, allowed_models: JSON.parse(row.allowed_models as string), allowed_tags: JSON.parse(row.allowed_tags as string) })));
+  return c.json(results.map(row => ({ ...row, can_reveal: !!row.can_reveal, allowed_models: JSON.parse(row.allowed_models as string), allowed_tags: JSON.parse(row.allowed_tags as string) })));
+});
+admin.get('/keys/:id/token', async c => {
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare('SELECT token_encrypted FROM api_keys WHERE id = ?').bind(id).first<{ token_encrypted: string | null }>();
+  if (!row) throw new ApiError(404, 'not_found', '应用密钥不存在');
+  if (!row.token_encrypted) throw new ApiError(409, 'key_not_recoverable', '此旧密钥仅保存哈希，无法恢复原文；如需可查看的令牌，请创建新密钥');
+  if (!encryptionConfigured(c.env.ENCRYPTION_KEY)) throw new ApiError(503, 'encryption_setup_required', '请配置有效的 ENCRYPTION_KEY：32 字节随机数据的 Base64 编码');
+  let key: string;
+  try { key = await decryptSecret(row.token_encrypted, c.env.ENCRYPTION_KEY, `api-key:${id}`); }
+  catch { throw new ApiError(500, 'key_decryption_failed', '无法解密此令牌，请确认 ENCRYPTION_KEY 与创建时一致'); }
+  return c.json({ key });
 });
 admin.post('/keys', async c => {
   const data = keySchema.parse(await c.req.json());
+  if (!encryptionConfigured(c.env.ENCRYPTION_KEY)) throw new ApiError(503, 'encryption_setup_required', '请配置有效的 ENCRYPTION_KEY：32 字节随机数据的 Base64 编码');
   if (data.expires_at && Date.parse(data.expires_at) <= Date.now()) throw invalid('过期时间必须晚于当前时间');
   const available = await c.env.DB.prepare('SELECT id FROM models').all<{ id: string }>();
   if (data.allowed_models.some(id => !available.results.some(m => m.id === id))) throw invalid('授权模型不存在');
   const known = await c.env.DB.prepare('SELECT DISTINCT value AS tag FROM provider_profiles, json_each(provider_profiles.tags)').all<{ tag: string }>();
   if (data.allowed_tags.some(tag => !known.results.some(row => row.tag === tag))) throw invalid('所选服务商标签不存在');
   const key = `eg_${randomToken()}`, id = `key_${randomToken(12)}`;
-  await c.env.DB.prepare('INSERT INTO api_keys (id, name, key_hash, prefix, allowed_models, rpm, daily_limit, expires_at, allowed_tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-    .bind(id, data.name, await sha256(key), key.slice(0, 11), JSON.stringify(data.allowed_models), data.rpm, data.daily_limit, data.expires_at ? new Date(data.expires_at).toISOString() : null, JSON.stringify(data.allowed_tags)).run();
+  const [hash, encrypted] = await Promise.all([sha256(key), encryptSecret(key, c.env.ENCRYPTION_KEY, `api-key:${id}`)]);
+  await c.env.DB.prepare('INSERT INTO api_keys (id, name, key_hash, prefix, allowed_models, rpm, daily_limit, expires_at, allowed_tags, token_encrypted) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+    .bind(id, data.name, hash, key.slice(0, 11), JSON.stringify(data.allowed_models), data.rpm, data.daily_limit, data.expires_at ? new Date(data.expires_at).toISOString() : null, JSON.stringify(data.allowed_tags), encrypted).run();
   return c.json({ id, key }, 201);
 });
 admin.delete('/keys/:id', async c => {

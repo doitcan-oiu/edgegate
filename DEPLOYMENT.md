@@ -23,7 +23,7 @@
 | 资源 | 本项目配置名 | 用途 |
 | --- | --- | --- |
 | Worker | `name`，默认 `edgegate` | 管理界面和 `/api/*`、`/v1/*` API |
-| D1 数据库 | 绑定名 `DB` | 渠道、加密供应商密钥、模型、应用密钥哈希、标签、配额及上游错误追踪 |
+| D1 数据库 | 绑定名 `DB` | 渠道、加密供应商密钥、模型、应用密钥哈希与加密原文、标签、配额及上游错误追踪 |
 | KV 命名空间 | 绑定名 `KV` | 管理员会话 |
 | AI Gateway | `vars.AI_GATEWAY_ID` | 转发推理、保存日志、提供分析 |
 
@@ -51,7 +51,7 @@
 | 名称 | 是否需要 | 内容 / 权限 |
 | --- | --- | --- |
 | `ADMIN_TOKEN` | 必需 | 控制台登录令牌，至少 32 字符 |
-| `ENCRYPTION_KEY` | 必需 | 32 字节随机数据的 Base64 编码，用于加密 D1 中的供应商 API Key、渠道 Token 覆盖值 |
+| `ENCRYPTION_KEY` | 必需 | 32 字节随机数据的 Base64 编码，用于加密 D1 中的供应商 API Key、渠道 Token 覆盖值及应用令牌原文 |
 | `CF_API_TOKEN` | 自定义服务商管理及日志分析需要 | 目标账户的 AI Gateway Read / Edit、Account Analytics Read |
 | `CF_AIG_TOKEN` | 可选 | 独立推理 Token，要求 AI Gateway Run；留空时推理使用 `CF_API_TOKEN`，后者必须额外具备 Run |
 | `CF_AI_TOKEN` | 可选 | 仅 Cloudflare AI REST / 统一计费渠道需要，要求 Workers AI Read；只用自定义服务商可不填 |
@@ -293,7 +293,7 @@ curl -sS "$EDGEGATE_URL/v1/messages" \
 
 Cloudflare REST 读取和 GraphQL 查询遇到 HTTP 5xx 时，最多额外重试 2 次（共最多 3 次请求）。持续失败会向页面返回错误并提供重试 / 刷新入口；没有旧快照回退，也不会把失败当作无数据。渠道可用率按本次读取的最近 1 小时日志汇总，读取预算不足或后续页失败会标明样本不完整。
 
-升级需应用全部未执行迁移，包含 `0009_remove_observability_cache.sql`。该迁移删除 `observability_logs`、`observability_snapshots`、`observability_jobs` 和 `observability_settings` 四张旧缓存表；业务配置、密钥、配额、历史 `request_logs` 与上游错误追踪保留。日志保留期限由 Cloudflare 管理，设置页已移除数据同步与本地保留期配置。
+升级需应用全部未执行迁移，包含 `0009_remove_observability_cache.sql` 和 `0010_recoverable_api_keys.sql`。`0010` 增加应用令牌加密存储，新建令牌可由管理员再次查看；旧令牌仅存哈希，不能恢复原文。`0009` 删除 `observability_logs`、`observability_snapshots`、`observability_jobs` 和 `observability_settings` 四张旧缓存表；业务配置、密钥、配额、历史 `request_logs` 与上游错误追踪保留。日志保留期限由 Cloudflare 管理，设置页已移除数据同步与本地保留期配置。
 
 发布 Worker 时使用 `triggers.crons = ["15 3 * * *"]`，仅在每天 UTC 03:15 清理过期配额及 7 天上游错误追踪。Cloudflare 数据读取与 Cron 无关，本地开发也可直接刷新页面读取。`CF_API_TOKEN` 需要在当前环境中配置。
 
@@ -303,7 +303,7 @@ Cloudflare REST 读取和 GraphQL 查询遇到 HTTP 5xx 时，最多额外重试
 - **本地更新**：依赖变化后执行 `npm ci`，检查通过后执行 `npm run deploy`。
 - **数据库升级**：新增编号递增的 SQL 迁移，不修改已经执行的旧迁移；迁移记录保存在 D1，重复部署只执行未应用的文件。[D1 迁移说明](https://developers.cloudflare.com/d1/reference/migrations/)
 - **备份与回滚**：涉及数据变更前备份 D1 或确认可用的恢复点。Worker 代码回滚不会撤销已经执行的 D1 迁移。
-- **保留凭据**：后续部署保持原 `ENCRYPTION_KEY`。直接换值会导致已保存的供应商 API Key 和渠道 Token 无法解密；应先完成凭据重新配置。备份恢复 D1 时同样需要对应的加密主密钥。更换 `ADMIN_TOKEN` 会使已有管理会话失效。
+- **保留凭据**：后续部署保持原 `ENCRYPTION_KEY`。直接换值会导致已保存的供应商 API Key、渠道 Token 和应用令牌原文无法解密；应先完成凭据重新配置。备份恢复 D1 时同样需要对应的加密主密钥。更换 `ADMIN_TOKEN` 会使已有管理会话失效。
 - **旧 BYOK 渠道**：升级后继续使用原别名。改为程序存储时，在编辑渠道中选择「程序加密存储」并重新输入供应商 API Key；原 Cloudflare BYOK 不会被删除。本次变更复用已有数据库字段，无需新增迁移。
 - **自定义域名**：在 Worker 的 Settings → Domains & Routes 添加 Custom Domain，按控制台引导配置；保留同域的前端与 API 访问方式。
 - **本地数据**：本地 D1 / KV 与线上独立，本地渠道和应用密钥不会随代码发布。若指向相同 Cloudflare Account / Gateway，云端服务商、BYOK 和日志仍是共享资源。

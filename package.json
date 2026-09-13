@@ -38,7 +38,7 @@
         "description": "控制台登录令牌，至少 32 字符。使用 openssl rand -hex 32 生成并单独保存。"
       },
       "ENCRYPTION_KEY": {
-        "description": "加密保存在 D1 的供应商 API Key。使用 openssl rand -base64 32 生成 32 字节 Base64 密钥，后续部署保持不变。"
+        "description": "加密保存在 D1 的供应商 API Key 和应用令牌原文。使用 openssl rand -base64 32 生成 32 字节 Base64 密钥，后续部署保持不变。"
       },
       "CF_API_TOKEN": {
         "description": "程序运行时的 Cloudflare Token：AI Gateway Read/Edit/Run、Account Analytics Read。供应商 API Key 由本程序加密存储，无需 Secrets Store 权限。与 Workers Builds 部署 Token 分开配置。"

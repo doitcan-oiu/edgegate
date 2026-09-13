@@ -33,7 +33,7 @@ flowchart LR
 | 应用 API Key、模型权限、模型别名、渠道映射、原子配额 | Worker + D1 |
 | 管理员会话 | Workers KV |
 
-前端静态资源和 API 由同一个 Worker 提供。管理接口不把 Cloudflare Token、供应商密钥明文或密文返回浏览器。客户端 API Key 仅保存 SHA-256 哈希。供应商密钥和 Cloudflare 渠道的可选 Token 覆盖值使用 AES-256-GCM 加密，密文与渠道 ID 绑定；加密主密钥 `ENCRYPTION_KEY` 保存在 Worker Secret 中。
+前端静态资源和 API 由同一个 Worker 提供。管理接口不把 Cloudflare Token、供应商密钥明文或密文返回浏览器。客户端 API Key 使用 SHA-256 哈希鉴权，新建令牌另以 AES-256-GCM 加密保存，并绑定应用密钥 ID；管理员可在「应用密钥」中按需查看和复制，列表不返回原文、哈希或密文。供应商密钥和 Cloudflare 渠道的可选 Token 覆盖值使用 AES-256-GCM 加密，密文与渠道 ID 绑定；加密主密钥 `ENCRYPTION_KEY` 保存在 Worker Secret 中。
 
 前端使用 HeroUI 的按钮、输入框、选择器、弹窗、开关、复选框、状态标签及页签，采用中性炭黑背景、深灰卡片与翠绿色强调色，使用顶部导航、流量工作台、渠道资源列表、模型目录与路由详情、密钥权限卡片，以及分组的侧边编辑抽屉。Playground 将对话与参数并列展示，设置页按连接、凭据与接入代码分类。主题变量统一在 `src/styles.css` 中定义；各管理页面按需加载，支持窄屏导航。
 
@@ -253,6 +253,8 @@ npm run db:migrate:remote
 
 `0002_ai_gateway_control_plane.sql` 为渠道增加 Cloudflare 服务商 ID、slug、请求路径、BYOK 别名。保留原模型、应用密钥、配额与历史 `request_logs` 表；旧日志不会删除，但新程序不再读写该表或运行日志清理任务。`0004_gateway_settings.sql` 新增程序设置与上游错误追踪表。`0005_channel_auto_routes.sql` 新增渠道自动路由开关，现有渠道默认开启。`0006_long_channel_timeout.sql` 将渠道超时上限放宽到 3600 秒，保留现有渠道、密钥和路由。`0007_observability_cache.sql` 是旧版观测数据缓存迁移。`0008_responses_protocol.sql` 扩展服务商协议约束以支持 Responses，并保留现有服务商、标签和模型清单；升级时需应用此迁移。`0009_remove_observability_cache.sql` 删除旧版的 `observability_logs`、`observability_snapshots`、`observability_jobs` 和 `observability_settings` 四张表，保留渠道、模型、密钥、配额、历史 `request_logs` 与上游错误追踪。升级时应用全部未执行的迁移；旧 Cloudflare 数据缓存将被移除，页面改为直接读取 Cloudflare。Cron 仅在每天 UTC 03:15 清理过期配额和 7 天上游错误追踪，不负责读取 Cloudflare 数据。
 
+`0010_recoverable_api_keys.sql` 为应用密钥增加可空的加密令牌字段；既有哈希、权限、配额、有效期和撤销状态不变。新建密钥需要有效的 `ENCRYPTION_KEY`，旧密钥不会自动重置或补出原文。
+
 旧「OpenAI 兼容」直连渠道会显示待配置，**不会继续直连供应商**。编辑渠道，将其关联到 Cloudflare 服务商，并确认请求路径。仅当完整上游 URL 与旧地址完全一致时，才会保留原有加密 Key；目的地不一致需重新输入密钥或提供已有 BYOK 别名。关联后推理经过 AI Gateway，密钥继续加密保存在 D1。
 
 ### 从 BYOK 版本升级
@@ -288,6 +290,8 @@ npm run deploy
 - 管理接口：`GET /api/config` 返回 `runtime` 配置；`PUT /api/config/runtime` 完整更新配置，校验取值范围和重复错误码。`GET /api/traces/{request-id}` 查询管理员错误追踪。
 
 D1 通过原子条件更新执行每个应用 Key 的每分钟 / 每日请求限额，使用 UTC 固定窗口；授权且格式有效的请求在路由前消耗一次配额，重试不重复计数。撤销立即影响后续鉴权，进行中的请求继续完成。KV 会话单独退出的跨区域传播受最终一致性影响，并有显式 24 小时到期限制。
+
+应用密钥支持通过卡片中的「查看令牌」打开原文并复制。`GET /api/keys/{id}/token` 仅允许已登录管理员访问，响应禁止缓存；关闭弹窗后清除本次展示内容。升级前仅保存哈希的旧密钥无法恢复原文，页面会标注「原文不可恢复」，不影响已有令牌的权限、配额和有效性。
 
 ## 工程与验证
 

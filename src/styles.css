@@ -228,6 +228,9 @@ i:not([class]) { font-style: normal; }.console-footer i, .access-footer i { disp
 .credential-inactive .credential-heading h2 { color: var(--muted); }
 .credential-token { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--border-subtle); color: var(--foreground); }
 .credential-token code { font-size: 12px; overflow-wrap: anywhere; }
+.credential-token > code { flex: 1; min-width: 0; }
+.credential-token > .btn { flex-shrink: 0; min-height: 28px; padding: 4px 6px; font-size: 11px; }
+.credential-token > small { flex-shrink: 0; font-size: 11px; }
 .credential-token code span { color: var(--subtle); margin-left: 8px; }
 .credential-scope { padding: 12px 14px; }
 .mini-label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
