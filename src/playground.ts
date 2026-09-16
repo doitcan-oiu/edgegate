@@ -8,14 +8,15 @@ export type PlaygroundMessage = ConversationMessage & {
 };
 export interface PlaygroundParameters { model: string; system: string; temperature: number; maxTokens: number; stream: boolean }
 
-export function availablePlaygroundModels<T extends Pick<Model, 'enabled'> & { routes: Pick<Model['routes'][number], 'enabled' | 'channel_id' | 'scope_tag'>[] }>(
+export function availablePlaygroundModels<T extends Pick<Model, 'enabled' | 'groups'> & { routes: Pick<Model['routes'][number], 'enabled' | 'channel_id' | 'scope_tag' | 'group_id'>[] }>(
   models: T[], channels: Pick<Channel, 'id' | 'tags' | 'enabled' | 'configured'>[], scope: RouteScope | null,
 ) {
   if (!scope) return [];
   const byId = new Map(channels.filter(channel => channel.enabled && channel.configured).map(channel => [channel.id, channel]));
   return models.filter(model => model.enabled && model.routes.some(route => {
     const channel = byId.get(route.channel_id);
-    return route.enabled && channel && matchesScopedRoute(route, channel.tags, scope);
+    const groupEnabled = !route.group_id || model.groups?.some(group => group.id === route.group_id && group.enabled);
+    return route.enabled && groupEnabled && channel && matchesScopedRoute(route, channel.tags, scope);
   }));
 }
 

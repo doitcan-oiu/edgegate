@@ -110,7 +110,7 @@ beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ name: 'edgegate-test', modules: true, script: bundle.outputFiles[0].text, compatibilityDate: '2026-09-01', compatibilityFlags: ['nodejs_compat'],
     bindings: { ADMIN_TOKEN: ADMIN, ENCRYPTION_KEY: ENCRYPTION, CLOUDFLARE_ACCOUNT_ID: account, AI_GATEWAY_ID: 'test-gateway', CF_AI_TOKEN: 'cf-ai-token', CF_AIG_TOKEN: 'cf-inference-token', CF_API_TOKEN: 'cf-control-token' }, d1Databases: ['DB'], kvNamespaces: ['KV'], outboundService: outbound }));
   db = await mf.getD1Database('DB');
-  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql', '0009_remove_observability_cache.sql', '0010_recoverable_api_keys.sql', '0011_cross_tag_routes.sql']) {
+  for (const file of ['0001_initial.sql', '0002_ai_gateway_control_plane.sql', '0003_protocols_and_tags.sql', '0004_gateway_settings.sql', '0005_channel_auto_routes.sql', '0006_long_channel_timeout.sql', '0007_observability_cache.sql', '0008_responses_protocol.sql', '0009_remove_observability_cache.sql', '0010_recoverable_api_keys.sql', '0011_cross_tag_routes.sql', '0012_route_groups.sql']) {
     const migration = await readFile(`migrations/${file}`, 'utf8');
     await db.batch(migration.split(';').filter(s => s.replace(/--[^\n]*/g, '').trim()).map(sql => db.prepare(sql)));
   }
@@ -1580,5 +1580,191 @@ describe('custom application models during route creation', () => {
     await Promise.all(results.map(result => result.text()));
     expect(await db.prepare("SELECT COUNT(*) AS n FROM models WHERE id = 'shared-new-model'").first()).toEqual({ n: 1 });
     expect(await db.prepare("SELECT COUNT(*) AS n FROM routes WHERE model_id = 'shared-new-model'").first()).toEqual({ n: 1 });
+  });
+});
+
+
+describe('two-level route groups', () => {
+  const model = 'claude-opus-4-6';
+  const group = (name: string, settings = {}) => admin<{ id: string }>('/route-groups', { model_id: model, create_model: true, name, ...settings });
+  const add = (channelId: string, groupId: string | null, settings = {}) => admin<{ id: string }>('/routes', { model_id: model, channel_id: channelId, upstream_model: model, group_id: groupId, ...settings });
+  it('creates a model with empty groups, preserves global model settings and exposes empty groups in tag views', async () => {
+    const a = await group('Primary', { priority: 0, weight: 3, strategy: 'random' });
+    await admin('/models/' + model, { description: 'Preserve model', enabled: false }, 'PUT');
+    const b = await group('Backup', { priority: 1, strategy: 'round_robin' });
+    const models = await admin<(Model & { routes: Route[]; groups: { id: string; route_count: number }[] })[]>('/models?tag=AA');
+    expect(models).toHaveLength(1);
+    expect(models[0]).toMatchObject({ id: model, description: 'Preserve model', enabled: 0, routes: [] });
+    expect(models[0].groups.map(g => g.id)).toEqual([a.id, b.id]);
+    expect(models[0].groups.every(g => g.route_count === 0)).toBe(true);
+    await admin('/route-groups/' + b.id, undefined, 'DELETE');
+    expect(await db.prepare('SELECT id FROM models WHERE id = ?').bind(model).first()).not.toBeNull();
+    expect((await request('/api/route-groups/' + b.id, { admin: true, method: 'DELETE' })).status).toBe(404);
+  });
+  it('validates group settings, immutable model ownership and administrative scope', async () => {
+    expect((await request('/api/route-groups', { body: { model_id: model, name: 'Unauthorized', create_model: true } })).status).toBe(401);
+    for (const data of [{ name: '' }, { priority: -1 }, { weight: 0 }, { weight: 1001 }, { strategy: 'unknown' }]) {
+      expect((await request('/api/route-groups', { admin: true, body: { model_id: model, name: 'Invalid', create_model: true, ...data } })).status).toBe(400);
+    }
+    expect(await db.prepare('SELECT id FROM models WHERE id = ?').bind(model).first()).toBeNull();
+    expect((await request('/api/route-groups', { admin: true, body: { model_id: model, name: 'No opt in' } })).status).toBe(400);
+    const g = await group('Primary');
+    expect((await request('/api/route-groups/' + g.id, { admin: true, method: 'PUT', body: { model_id: 'test-model', name: 'Moved' } })).status).toBe(400);
+    for (const method of ['PUT', 'DELETE']) expect((await request('/api/route-groups/' + g.id + '?tag=AA', { admin: true, method, ...(method === 'PUT' ? { body: { model_id: model, name: 'Changed' } } : {}) })).status).toBe(400);
+    expect((await request('/api/route-groups?tag=AA', { admin: true, body: { model_id: model, name: 'Scoped' } })).status).toBe(400);
+  });
+  it('validates membership, preserves it for older clients and refuses to delete nonempty groups', async () => {
+    const g = await group('Primary');
+    const a = await catalog('GroupMember', 'openai', ['AA'], []);
+    const route = await add(a.channelId, g.id);
+    expect((await request('/api/route-groups/' + g.id, { admin: true, method: 'DELETE' })).status).toBe(409);
+    const input = { model_id: model, channel_id: a.channelId, upstream_model: model, priority: 2 };
+    await admin('/routes/' + route.id + '?tag=AA', input, 'PUT');
+    expect(await db.prepare('SELECT group_id FROM routes WHERE id = ?').bind(route.id).first()).toEqual({ group_id: g.id });
+    expect((await request('/api/routes', { admin: true, body: { ...input, upstream_model: 'other', group_id: 'missing' } })).status).toBe(400);
+    expect((await request('/api/routes', { admin: true, body: { ...input, model_id: 'test-model', group_id: g.id } })).status).toBe(400);
+    await editProvider(a.provider, { models: [model] });
+    expect((await db.prepare('SELECT id FROM routes WHERE channel_id = ?').bind(a.channelId).all()).results).toHaveLength(1);
+    await admin('/routes/' + route.id + '?tag=AA', { ...input, group_id: null }, 'PUT');
+    expect(await db.prepare('SELECT group_id FROM routes WHERE id = ?').bind(route.id).first()).toEqual({ group_id: null });
+    await admin('/route-groups/' + g.id, undefined, 'DELETE');
+    expect(await db.prepare('SELECT id FROM routes WHERE id = ?').bind(route.id).first()).not.toBeNull();
+  });
+  it('uses every eligible route in P0 before P1 even when P1 routes have lower route priorities', async () => {
+    const first = await group('P0', { priority: 0, weight: 1, strategy: 'random' });
+    const backup = await group('P1', { priority: 1, weight: 1000, strategy: 'random' });
+    for (const name of ['Firsta', 'Firstb', 'Firstc']) await add(await channel(name, name.toLowerCase() + '.example.com'), first.id, { priority: 10 });
+    await add(await channel('Backup', 'backup.example.com'), backup.id, { priority: 0 });
+    await runtime({ load_balancing: 'weighted', same_channel_retries: 0, cross_channel_retries: 3 });
+    upstream = req => req.url.includes('/custom-backup/') ? MFResponse.json(completion) : MFResponse.json({ error: 'busy' }, { status: 503 });
+    const token = (await key()).key;
+    expect((await chat(token, { model })).status).toBe(200);
+    expect(calls).toHaveLength(4);
+    expect(calls.slice(0, 3).map(c => JSON.parse(c.headers['cf-aig-metadata']).channel_name).sort()).toEqual(['Firsta', 'Firstb', 'Firstc']);
+    expect(calls[3].url).toContain('/custom-backup/');
+    calls = [];
+    await runtime({ same_channel_retries: 0, cross_channel_retries: 1 });
+    expect((await chat(token, { model })).status).toBe(502);
+    expect(calls).toHaveLength(2); expect(calls.every(call => !call.url.includes('/custom-backup/'))).toBe(true);
+  });
+  it('honors route priority inside a group before advancing to another group', async () => {
+    const g = await group('First', { strategy: 'round_robin' });
+    const fallback = await group('Fallback', { priority: 1 });
+    await add(await channel('Tierzero', 'tierzero.example.com'), g.id, { priority: 0 });
+    await add(await channel('Tierone', 'tierone.example.com'), g.id, { priority: 1 });
+    await add(await channel('Nextgroup', 'nextgroup.example.com'), fallback.id, { priority: 0 });
+    await runtime({ same_channel_retries: 0, cross_channel_retries: 4 });
+    upstream = req => req.url.includes('/custom-tierone/') ? MFResponse.json(completion) : MFResponse.json({ error: 'busy' }, { status: 503 });
+    expect((await chat((await key()).key, { model })).status).toBe(200);
+    expect(calls.map(c => JSON.parse(c.headers['cf-aig-metadata']).channel_name)).toEqual(['Tierzero', 'Tierone']);
+    expect((await db.prepare('SELECT * FROM route_group_cursors WHERE group_id = ?').bind(fallback.id).all()).results).toEqual([]);
+  });
+  it('removes disabled groups from inference, public model listing and Playground without changing route enabled flags', async () => {
+    const g = await group('Primary');
+    const a = await catalog('GroupOff', 'openai', ['AA'], []);
+    const route = await add(a.channelId, g.id);
+    const token = (await key({ allowed_tags: ['AA'] })).key;
+    expect(await visibleModels(token)).toEqual([model]);
+    await admin('/route-groups/' + g.id, { model_id: model, name: 'Primary', enabled: false }, 'PUT');
+    expect(await visibleModels(token)).toEqual([]);
+    expect((await chat(token, { model })).status).toBe(403);
+    expect((await request('/api/playground?tag=AA', { admin: true, body: { model, messages: [{ role: 'user', content: 'hello' }] } })).status).toBe(503);
+    expect(await db.prepare('SELECT enabled FROM routes WHERE id = ?').bind(route.id).first()).toEqual({ enabled: 1 });
+    await admin('/route-groups/' + g.id, { model_id: model, name: 'Primary', enabled: true }, 'PUT');
+    expect((await chat(token, { model })).status).toBe(200);
+  });
+  it('filters tags before selecting groups and permits only explicitly configured cross-tag routes', async () => {
+    const primary = await group('Primary', { priority: 0 });
+    const fallback = await group('Fallback', { priority: 1 });
+    const a = await catalog('GroupTaga', 'openai', ['AA'], []), b = await catalog('GroupTagb', 'openai', ['BB'], []);
+    await add(a.channelId, primary.id);
+    await add(b.channelId, primary.id);
+    const token = (await key({ allowed_tags: ['AA'] })).key;
+    await runtime({ same_channel_retries: 0, cross_channel_retries: 5 });
+    upstream = req => req.url.includes('/custom-grouptaga/') ? MFResponse.json({ error: 'busy' }, { status: 503 }) : MFResponse.json(completion);
+    expect((await chat(token, { model })).status).toBe(502); expect(calls).toHaveLength(1);
+    const cross = await admin<{ id: string }>('/routes?tag=AA', { model_id: model, channel_id: b.channelId, upstream_model: model, group_id: fallback.id });
+    calls = []; expect((await chat(token, { model })).status).toBe(200);
+    expect(calls.map(c => JSON.parse(c.headers['cf-aig-metadata']).channel_name)).toEqual(['GroupTaga', 'GroupTagb']);
+    const bb = await admin<(Model & { routes: Route[]; groups: { id: string }[] })[]>('/models?tag=BB');
+    expect(bb[0].groups.map(g => g.id)).toEqual([primary.id]);
+    expect(bb[0].routes.some(r => r.id === cross.id)).toBe(false);
+  });
+  it('rotates group routes across sequential and concurrent requests using persistent atomic cursors', async () => {
+    const g = await group('Round robin', { strategy: 'round_robin' });
+    for (const name of ['Rotatea', 'Rotateb', 'Rotatec']) await add(await channel(name, name.toLowerCase() + '.example.com'), g.id);
+    const token = (await key()).key;
+    for (let n = 0; n < 6; n++) { const result = await chat(token, { model }); expect(result.status).toBe(200); await result.text(); }
+    const names = calls.map(call => JSON.parse(call.headers['cf-aig-metadata']).channel_name);
+    expect(new Set(names.slice(0, 3)).size).toBe(3); expect(names.slice(0, 3)).toEqual(names.slice(3));
+    calls = [];
+    const responses = await Promise.all(Array.from({ length: 9 }, () => chat(token, { model })));
+    for (const result of responses) { expect(result.status).toBe(200); await result.text(); }
+    for (const name of ['Rotatea', 'Rotateb', 'Rotatec']) expect(calls.filter(call => JSON.parse(call.headers['cf-aig-metadata']).channel_name === name)).toHaveLength(3);
+    expect((await db.prepare('SELECT * FROM route_group_cursors WHERE group_id = ?').bind(g.id).all()).results).toHaveLength(1);
+  });
+  it('isolates round-robin fairness between different authorized candidate sets', async () => {
+    const g = await group('Scoped round robin', { strategy: 'round_robin' });
+    const a = await catalog('Faira', 'openai', ['AA'], []), b = await catalog('Fairb', 'openai', ['AA', 'BB'], []);
+    await add(a.channelId, g.id); await add(b.channelId, g.id);
+    const aa = (await key({ allowed_tags: ['AA'] })).key, bb = (await key({ allowed_tags: ['BB'] })).key;
+    for (const token of [aa, bb, aa, bb, aa, bb, aa]) { const result = await chat(token, { model }); expect(result.status).toBe(200); await result.text(); }
+    const names = calls.map(call => JSON.parse(call.headers['cf-aig-metadata']).channel_name);
+    expect(names[0]).not.toBe(names[2]); expect(names[0]).toBe(names[4]); expect(names[2]).toBe(names[6]);
+    expect([names[1], names[3], names[5]]).toEqual(['Fairb', 'Fairb', 'Fairb']);
+  });
+});
+
+
+describe('route group changes during concurrent administration', () => {
+  async function directRequest(path: string, method: string, body: unknown, database: D1Database) {
+    return worker.fetch(new Request('https://edgegate.example/api' + path, { method,
+      headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }), {
+      DB: database, KV: await mf.getKVNamespace('KV'), ADMIN_TOKEN: ADMIN,
+    } as unknown as Env);
+  }
+  it('rejects a stale legacy edit instead of moving a concurrently disabled route back to the default group', async () => {
+    const g = await admin<{ id: string }>('/route-groups', { model_id: 'test-model', name: 'Disabled', enabled: false });
+    const saved = await db.prepare("SELECT * FROM routes WHERE model_id = 'test-model'").first<Route>();
+    const database = {
+      prepare(sql: string) {
+        if (!sql.startsWith('UPDATE routes SET managed_by_provider')) return db.prepare(sql);
+        return { bind(...values: (string | number | null)[]) { return { async run() {
+          await db.prepare('UPDATE routes SET group_id = ? WHERE id = ?').bind(g.id, saved!.id).run();
+          return db.prepare(sql).bind(...values).run();
+        } }; } };
+      },
+    } as unknown as D1Database;
+    const result = await directRequest('/routes/' + saved!.id, 'PUT', { model_id: saved!.model_id, channel_id: saved!.channel_id, upstream_model: saved!.upstream_model, weight: 4 }, database);
+    expect(result.status).toBe(409);
+    expect(await db.prepare('SELECT group_id, weight FROM routes WHERE id = ?').bind(saved!.id).first()).toEqual({ group_id: g.id, weight: saved!.weight });
+    expect(await visibleModels((await key()).key)).toEqual([]);
+  });
+  it('does not resurrect a concurrently deleted model when its selected group no longer exists', async () => {
+    const g = await admin<{ id: string }>('/route-groups', { model_id: 'new-group-model', name: 'Original', create_model: true });
+    const existing = await db.prepare('SELECT id FROM channels LIMIT 1').first<{ id: string }>();
+    const database = {
+      prepare: (sql: string) => db.prepare(sql),
+      async batch(statements: Parameters<typeof db.batch>[0]) {
+        await db.prepare("DELETE FROM models WHERE id = 'new-group-model'").run();
+        return db.batch(statements);
+      },
+    } as unknown as D1Database;
+    const result = await directRequest('/routes', 'POST', { model_id: 'new-group-model', channel_id: existing!.id, upstream_model: 'test', create_model: true, group_id: g.id }, database);
+    expect(result.status).toBe(409);
+    expect(await db.prepare("SELECT id FROM models WHERE id = 'new-group-model'").first()).toBeNull();
+  });
+  it('does not allocate a backup round-robin cursor once the request reaches its retry cap', async () => {
+    const primary = await admin<{ id: string }>('/route-groups', { model_id: 'test-model', name: 'Primary' });
+    const backup = await admin<{ id: string }>('/route-groups', { model_id: 'test-model', name: 'Backup', priority: 1, strategy: 'round_robin' });
+    await db.prepare("UPDATE routes SET group_id = ? WHERE model_id = 'test-model'").bind(primary.id).run();
+    for (const name of ['Limitbacka', 'Limitbackb']) {
+      await admin('/routes', { model_id: 'test-model', channel_id: await channel(name, name.toLowerCase() + '.example.com'), upstream_model: 'upstream', group_id: backup.id });
+    }
+    await runtime({ same_channel_retries: 0, cross_channel_retries: 0 });
+    upstream = () => MFResponse.json({ error: 'busy' }, { status: 503 });
+    expect((await chat((await key()).key)).status).toBe(502);
+    expect(calls).toHaveLength(1);
+    expect((await db.prepare('SELECT * FROM route_group_cursors WHERE group_id = ?').bind(backup.id).all()).results).toEqual([]);
   });
 });

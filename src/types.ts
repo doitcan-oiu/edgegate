@@ -1,4 +1,6 @@
 import type { Protocol } from '../shared/protocols';
+import type { RouteGroup } from '../shared/routing';
+export type { RouteGroup } from '../shared/routing';
 export type { Protocol } from '../shared/protocols';
 export interface Channel {
   protocol: Protocol; tags: string[]; models: string[];
@@ -12,9 +14,10 @@ export interface ProviderPage { data: CustomProvider[]; page: number; total: num
 export interface Route {
   id: string; model_id: string; channel_id: string; upstream_model: string;
   scope_tag?: string;
+  group_id?: string | null;
   priority: number; weight: number; input_price: number | null; output_price: number | null; enabled: number;
 }
-export interface Model { id: string; description: string; enabled: number; created_at: string; routes: Route[] }
+export interface Model { id: string; description: string; enabled: number; created_at: string; routes: Route[]; groups?: RouteGroup[] }
 export interface ApiKey {
   can_reveal: boolean;
   allowed_tags: string[];

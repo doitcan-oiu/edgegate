@@ -21,9 +21,10 @@ export function RuntimeSettings({ initial }: { initial: GatewaySettings }) {
     setValue(previous => ({ ...previous, upstream_error_rules: previous.upstream_error_rules.map((rule, i) => i === index ? { ...rule, ...update } : rule) }));
   }
   return <form className="runtime-settings" onSubmit={submit}>
-    <section className="runtime-section"><div className="runtime-section-heading"><h2>负载均衡</h2><p>先按优先级选择渠道，再使用以下策略分配同优先级的请求。</p></div>
-      <Field label="分配策略"><Select value={value.load_balancing} disabled={busy} onChange={strategy => setValue({ ...value, load_balancing: strategy as GatewaySettings['load_balancing'] })}><option value="random">多渠道随机</option><option value="weighted">按照权重</option></Select></Field>
-      <p className="runtime-hint">{value.load_balancing === 'weighted' ? '使用「模型与路由」中的路由权重。权重越高，被选中的概率越大。' : '同优先级的不同渠道具有相同的选择概率，不使用路由权重。'}</p>
+    <section className="runtime-section"><div className="runtime-section-heading"><h2>负载均衡</h2><p>先按路由组优先级选择可用组，再使用以下策略分配同优先级组的请求。</p></div>
+      <Field label="组分配策略"><Select value={value.load_balancing} disabled={busy} onChange={strategy => setValue({ ...value, load_balancing: strategy as GatewaySettings['load_balancing'] })}><option value="random">随机选择组</option><option value="weighted">按照权重</option></Select></Field>
+      <p className="runtime-hint">{value.load_balancing === 'weighted' ? '使用「模型与路由」中的组权重。同优先级组的权重越高，被选中的概率越大。' : '同优先级的可用组具有相同的选择概率，不使用组权重。'}选中组后，按组内路由优先级与该组的分配策略选择上游。</p>
+      <p className="runtime-hint">每个组可独立选择随机、按照权重或轮询。未分组路由归入默认组，组内继续沿用此处的策略。</p>
     </section>
     <section className="runtime-section"><div className="runtime-section-heading"><h2>重试配置</h2><p>重试次数不包含首次请求。已尝试的渠道不会再次被选为新渠道。</p></div>
       <div className="runtime-columns"><Field label="单渠道最大重试次数" hint="0–5 次。临时故障时先重试当前渠道，再尝试其他渠道。"><Input type="number" required min={0} max={5} step={1} disabled={busy} value={value.same_channel_retries} onChange={event => setValue({ ...value, same_channel_retries: Number(event.target.value) })} /></Field>

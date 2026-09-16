@@ -6,7 +6,8 @@
 .models-scope-summary { padding-left: 10px; border-left: 1px solid var(--border); color: var(--muted); font-size: 12px; white-space: nowrap; font-variant-numeric: tabular-nums; }
 .models-page-heading p { margin-top: 6px; color: var(--muted); font-size: 13px; }
 .models-page .btn { min-height: 32px; font-size: 13px; font-weight: 400; }
-.models-page-heading > .btn { min-height: 34px; font-size: 14px; }
+.models-page-actions { display: flex; flex-shrink: 0; flex-wrap: wrap; gap: 8px; }
+.models-page-actions > .btn { min-height: 34px; font-size: 13px; }
 .model-scope-bar { padding: 10px 12px; border: 1px solid var(--border); border-radius: 5px; background: var(--surface-inset); }
 .model-scope-options { display: flex; flex: 1; flex-wrap: wrap; gap: 6px; min-width: min(100%,220px); max-height: 112px; padding: 2px; margin: -2px; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
 .models-page .btn.model-scope-tag { min-height: 30px; height: auto; max-width: 100%; padding: 4px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); color: var(--muted); font-size: 13px; line-height: 1.5; white-space: normal; overflow-wrap: anywhere; }
@@ -46,6 +47,27 @@
 .routing-toolbar h3 { font-size: 14px; font-weight: 500; }
 .routing-toolbar > div > span { color: var(--subtle); font-size: 12px; font-variant-numeric: tabular-nums; }
 .routing-toolbar .btn { min-height: 30px; padding: 4px 9px; }
+.routing-toolbar .routing-toolbar-actions { align-items: center; gap: 6px; }
+.routing-group-guide { flex-shrink: 0; padding-bottom: 12px; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.route-groups { display: flex; flex: 1; flex-direction: column; gap: 14px; min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; padding: 1px 2px 2px 1px; }
+.route-group { flex-shrink: 0; min-width: 0; border: 1px solid var(--border); border-radius: 5px; background: var(--surface); }
+.route-group-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 11px 12px; border-bottom: 1px solid var(--border-subtle); background: var(--surface-inset); border-radius: 5px 5px 0 0; }
+.route-group-copy { flex: 1; min-width: 140px; }
+.route-group-title { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; min-width: 0; }
+.route-group-title > svg { flex-shrink: 0; color: var(--brand-green); }
+.route-group-title h4 { min-width: 0; overflow-wrap: anywhere; color: var(--brand-navy); font-size: 14px; font-weight: 500; line-height: 1.5; }
+.route-group-title .priority-token { padding: 2px 5px; border-radius: 3px; background: var(--brand-pale-green); }
+.route-group-title .badge { font-size: 11px; }
+.route-group-meta { display: flex; flex-wrap: wrap; gap: 2px 12px; margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.6; font-variant-numeric: tabular-nums; }
+.route-group-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; }
+.models-page .route-group-actions .btn { min-height: 28px; padding: 4px 7px; font-size: 12px; }
+.models-page .route-group-actions .icon-btn { width: 28px; padding: 5px; }
+.route-group-disabled .route-group-heading { background: var(--brand-stone); }
+.route-group-disabled .route-group-title h4, .route-group-disabled .route-upstream { color: var(--muted); }
+.route-group .route-table-scroll { border: 0; border-radius: 0 0 4px 4px; }
+.route-group .route-table th { position: static; }
+.route-group-empty { padding: 24px 12px; color: var(--muted); font-size: 12px; line-height: 1.6; text-align: center; }
+.route-group-default-note { padding: 8px 12px; border-top: 1px solid var(--border-subtle); color: var(--muted); font-size: 11px; line-height: 1.6; }
 .route-table-scroll { min-height: 0; overflow: auto; overscroll-behavior: contain; scrollbar-width: thin; border: 1px solid var(--border); border-radius: 4px; }
 .route-table-scroll:focus-visible { outline: 2px solid var(--focus); outline-offset: 2px; }
 .route-table { width: 100%; min-width: 690px; table-layout: fixed; border-collapse: separate; border-spacing: 0; }
@@ -98,6 +120,7 @@
 .route-model-empty { display: block; padding: 10px; color: var(--muted); font-size: 12px; }
 .route-channel-tags { display: block; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
 @media (max-width: 1100px) {
+  .models-page-heading { align-items: flex-start; flex-wrap: wrap; }
   .model-workspace { grid-template-columns: 224px minmax(0,1fr); }
   .routing-workspace { padding-inline: 14px; }
 }
@@ -112,5 +135,9 @@
   .directory-foot { display: none; }
   .routing-workspace { padding-inline: 12px; }
   .routing-heading { flex-wrap: wrap; gap: 6px; padding-top: 12px; }
+  .routing-toolbar { flex-wrap: wrap; gap: 8px; }
+  .route-groups { flex: auto; max-height: 70dvh; }
+  .route-group-heading { padding: 10px; }
+  .route-group-actions { width: 100%; justify-content: flex-end; }
   .route-table-scroll { max-height: 56dvh; }
 }

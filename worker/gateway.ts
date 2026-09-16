@@ -4,7 +4,7 @@ import { ApiError } from './lib/errors';
 import { chatSchema, messagesSchema, responsesSchema } from './lib/validation';
 import { authenticateKey, canUseModel } from './auth';
 import { consumeLimit } from './lib/rate-limit';
-import { getCandidates, orderCandidates, requestUpstream } from './upstream';
+import { getCandidates, iterateCandidates, requestUpstream } from './upstream';
 import { readLimited } from './lib/stream';
 import { convertRequest, convertResponse, validateResponse, type InferenceInput } from './protocols/convert';
 import { convertStream } from './protocols/stream';
@@ -53,17 +53,31 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
   if (!limit.allowed) { c.header('Retry-After', String(limit.retryAfter)); throw new ApiError(429, 'rate_limited', '已达到请求频率或每日请求上限'); }
   const requestId = c.get('requestId');
   let attempts = 0, channelsTried = 0;
-  const candidates = orderCandidates(available, Math.random, settings.load_balancing);
-  if (!candidates.length) { throw new ApiError(503, 'no_available_route', scope && scope.kind !== 'all' ? '当前标签范围内没有此模型的可用路由，请检查渠道配置和启用状态' : '此模型没有已配置且启用的渠道，请检查渠道凭据和模型路由'); }
+  if (!available.length) { throw new ApiError(503, 'no_available_route', scope && scope.kind !== 'all' ? '当前标签范围内没有此模型的可用路由，请检查渠道配置和启用状态' : '此模型没有已配置且启用的渠道，请检查渠道凭据和模型路由'); }
   let lastFailure = upstreamFailure(null, '', 'upstream_unavailable');
   let conversionError: ApiError | undefined;
-  for (const candidate of candidates) {
+  const convertedInputs = new Map<Protocol, InferenceInput>();
+  const unsupportedProtocols = new Set<Protocol>();
+  // Filter incompatible protocols before allocating a group cursor. Requests
+  // with different compatible/authorized route sets rotate independently.
+  const compatible = available.filter(candidate => {
+    const upstreamProtocol = candidate.channel.protocol || 'openai';
+    if (unsupportedProtocols.has(upstreamProtocol)) return false;
+    if (!convertedInputs.has(upstreamProtocol)) {
+      try { convertedInputs.set(upstreamProtocol, convertRequest(input, protocol, upstreamProtocol)); }
+      catch (error) {
+        if (!(error instanceof ApiError) || error.code !== 'unsupported_conversion') throw error;
+        conversionError = error; unsupportedProtocols.add(upstreamProtocol); return false;
+      }
+    }
+    return true;
+  });
+  const candidates = iterateCandidates(c.env, compatible, Math.random, settings.load_balancing);
+  for await (const candidate of candidates) {
     if (c.req.raw.signal.aborted) { throw new ApiError(499, 'client_disconnected', '客户端已断开连接'); }
     if (channelsTried >= settings.cross_channel_retries + 1) break;
     const upstreamProtocol = candidate.channel.protocol || 'openai';
-    let converted: InferenceInput;
-    try { converted = convertRequest(input, protocol, upstreamProtocol); }
-    catch (error) { if (error instanceof ApiError && error.code === 'unsupported_conversion') { conversionError = error; continue; } throw error; }
+    const converted = convertedInputs.get(upstreamProtocol)!;
     channelsTried++;
     for (let retry = 0; retry <= settings.same_channel_retries; retry++) {
       if (retry) await retryPause(Math.min(100 * 2 ** (retry - 1), 1000), c.req.raw.signal);
@@ -132,6 +146,9 @@ export async function chat(c: Context<AppEnv>, playground = false, protocol: Pro
         await response?.body?.cancel().catch(() => {});
       } finally { if (!streaming) clearTimeout(timer); }
     }
+    // Stop before advancing the iterator, so unused fallback groups and tiers
+    // do not consume a round-robin position after the retry budget is spent.
+    if (channelsTried >= settings.cross_channel_retries + 1) break;
   }
   if (!attempts && conversionError) throw conversionError;
   const exposed = publicUpstreamError(settings, lastFailure);

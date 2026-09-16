@@ -2,6 +2,7 @@ import { useContext, useState } from 'react';
 import { Activity, ArrowRight, Check, ChevronRight, Cloud, Copy, GitBranch, KeyRound, Radio, RefreshCw, Terminal } from 'lucide-react';
 import { useApi, number, compact, money, copy, ToastContext } from '../lib';
 import type { Stats, Channel, ApiKey, Model, LogPage, Log, Config } from '../types';
+import { availablePlaygroundModels } from '../playground';
 import { Badge, Button, Empty, ErrorBox, Loading, LogDetail, LogTable, PageTitle, Select } from '../components';
 
 function TrafficChart({ stats }: { stats: Stats | null }) {
@@ -35,7 +36,7 @@ export function Dashboard() {
   const steps = [
     { label: '连接 AI Gateway', detail: '配置账户与访问令牌', done: !!config.data && !setupRequired, href: '#settings', icon: Cloud },
     { label: '接入模型服务商', detail: `${readyChannels} 个已配置渠道`, done: readyChannels > 0, href: '#channels', icon: Radio },
-    { label: '设置模型路由', detail: `${models.data?.length ?? '—'} 个模型`, done: !!models.data?.some(model => model.enabled && model.routes.some(route => route.enabled && channels.data?.some(channel => channel.id === route.channel_id && channel.enabled && channel.configured))), href: '#models', icon: GitBranch },
+    { label: '设置模型路由', detail: `${models.data?.length ?? '—'} 个模型`, done: availablePlaygroundModels(models.data || [], channels.data || [], { kind: 'all' }).length > 0, href: '#models', icon: GitBranch },
     { label: '创建应用密钥', detail: `${activeKeys} 个有效密钥`, done: activeKeys > 0, href: '#keys', icon: KeyRound },
   ];
   const metrics = [

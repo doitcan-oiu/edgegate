@@ -50,11 +50,18 @@ export const providerSchema = z.object({
 export const modelSchema = z.object({ id: modelId, description: z.string().trim().max(300).default(''), enabled: z.boolean().default(true) });
 export const routeSchema = z.object({
   model_id: modelId, channel_id: z.string().min(1).max(100), upstream_model: modelId,
+  group_id: z.string().min(1).max(100).nullable().optional(),
   priority: z.number().int().min(0).max(1000).default(0), weight: z.number().int().min(1).max(1000).default(1),
   input_price: z.number().min(0).max(100000).nullable().default(null),
   output_price: z.number().min(0).max(100000).nullable().default(null), enabled: z.boolean().default(true),
 });
 export const routeCreateSchema = routeSchema.extend({ create_model: z.boolean().default(false) });
+export const routeGroupSchema = z.object({
+  model_id: modelId, name: nameSchema,
+  priority: z.number().int().min(0).max(1000).default(0), weight: z.number().int().min(1).max(1000).default(1),
+  strategy: z.enum(['random', 'weighted', 'round_robin']).default('random'), enabled: z.boolean().default(true),
+});
+export const routeGroupCreateSchema = routeGroupSchema.extend({ create_model: z.boolean().default(false) });
 export const keySchema = z.object({
   allowed_tags: tagsSchema.default([]),
   name: nameSchema, allowed_models: z.array(modelId).max(100).default([]),

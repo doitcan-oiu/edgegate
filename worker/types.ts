@@ -1,4 +1,6 @@
 import type { Protocol } from '../shared/protocols';
+import type { RouteGroup } from '../shared/routing';
+export type { RouteGroup } from '../shared/routing';
 export type { Protocol } from '../shared/protocols';
 
 export interface Env {
@@ -26,9 +28,10 @@ export interface Model { id: string; description: string; enabled: number; creat
 export interface Route {
   id: string; model_id: string; channel_id: string; upstream_model: string;
   scope_tag?: string; // Empty or absent: inherit channel tags. Otherwise: this tag only.
+  group_id?: string | null;
   priority: number; weight: number; input_price: number | null; output_price: number | null; enabled: number;
 }
-export type Candidate = Route & { channel: Channel };
+export type Candidate = Route & { channel: Channel; group?: RouteGroup | null };
 export interface ApiKey {
   id: string; name: string; key_hash: string; prefix: string; allowed_models: string;
   allowed_tags: string;
